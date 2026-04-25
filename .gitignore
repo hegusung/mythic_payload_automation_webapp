@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.venv/
+*.egg-info/
+
+# Node
+node_modules/
+frontend/dist/
+
+# Database & local data
+*.db
+*.sqlite
+*.sqlite3
+
+# Dev artifacts
+screenshots/
+files/
+AUTO_IMPROVEMENTS*
+hourly-improve.sh
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+*.log

@@ -1,0 +1,36 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      DATABASE_URL: sqlite:////data/mythic_payloads.db
+      # Optional: pre-seed Mythic connection via env (can also be set in the UI)
+      MYTHIC_URL: ${MYTHIC_URL:-}
+      MYTHIC_USERNAME: ${MYTHIC_USERNAME:-}
+      MYTHIC_PASSWORD: ${MYTHIC_PASSWORD:-}
+    volumes:
+      - backend_data:/data
+    ports:
+      - "127.0.0.1:7081:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "0.0.0.0:7080:80"
+    restart: unless-stopped
+
+volumes:
+  backend_data:
