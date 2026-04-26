@@ -3,8 +3,9 @@ import { api } from '../api/client'
 import { showToast } from './Toast'
 
 export default function Settings() {
-  const [form, setForm] = useState({ mythic_url: '', mythic_username: '', mythic_password: '' })
+  const [form, setForm] = useState({ mythic_url: '', mythic_username: '', mythic_password: '', payload_server_url: '', payload_server_token: '' })
   const [passwordSet, setPasswordSet] = useState(false)
+  const [psTokenSet, setPsTokenSet] = useState(false)
 
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -18,8 +19,11 @@ export default function Settings() {
           mythic_url: data.mythic_url || '',
           mythic_username: data.mythic_username || '',
           mythic_password: '',
+          payload_server_url: data.payload_server_url || '',
+          payload_server_token: '',
         })
         setPasswordSet(data.mythic_password_set || false)
+        setPsTokenSet(data.payload_server_token_set || false)
       })
       .catch(e => showToast(`Failed to load settings: ${e.message}`, 'error'))
       .finally(() => setLoading(false))
@@ -32,10 +36,13 @@ export default function Settings() {
         mythic_url: form.mythic_url || null,
         mythic_username: form.mythic_username || null,
         mythic_password: form.mythic_password || null,
+        payload_server_url: form.payload_server_url || null,
+        payload_server_token: form.payload_server_token || null,
       }
       const data = await api.updateSettings(payload)
       setPasswordSet(data.mythic_password_set)
-      setForm(f => ({ ...f, mythic_password: '' }))
+      setPsTokenSet(data.payload_server_token_set)
+      setForm(f => ({ ...f, mythic_password: '', payload_server_token: '' }))
       showToast('Settings saved.', 'success')
     } catch (e) {
       showToast(`Save failed: ${e.message}`, 'error')
@@ -146,6 +153,46 @@ export default function Settings() {
       </div>
 
 
+
+      {/* Payload Server */}
+      <div className="rounded-xl border border-gray-700/40 bg-gray-800/20 p-6 space-y-5">
+        <div>
+          <h2 className="text-base font-semibold text-gray-200">Payload Server</h2>
+          <p className="text-xs text-gray-500 mt-1">
+            Optional — if configured, downloader stages will upload payloads here instead of using Mythic's c2HostFile.
+            Enables <code className="text-orange-300">downloader_contenttype</code> and <code className="text-orange-300">downloader_prepend</code> stage parameters.
+          </p>
+        </div>
+
+        <div className="space-y-4">
+          <div>
+            <label className="block text-xs font-semibold text-gray-400 uppercase tracking-wider mb-1.5">
+              Server URL
+            </label>
+            <input
+              type="url"
+              value={form.payload_server_url}
+              onChange={e => setForm(f => ({ ...f, payload_server_url: e.target.value }))}
+              placeholder="http://192.168.1.100:8080"
+              className="w-full bg-gray-900/60 border border-gray-600/40 rounded-lg px-3 py-2.5 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-orange-500/60 transition"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-semibold text-gray-400 uppercase tracking-wider mb-1.5">
+              Token {psTokenSet && !form.payload_server_token && (
+                <span className="ml-2 text-xs text-green-500 font-normal normal-case">● saved</span>
+              )}
+            </label>
+            <input
+              type="password"
+              value={form.payload_server_token}
+              onChange={e => setForm(f => ({ ...f, payload_server_token: e.target.value }))}
+              placeholder={psTokenSet ? '(leave blank to keep current)' : 'MGMT_TOKEN'}
+              className="w-full bg-gray-900/60 border border-gray-600/40 rounded-lg px-3 py-2.5 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-orange-500/60 transition"
+            />
+          </div>
+        </div>
+      </div>
 
       <div className="rounded-xl border border-gray-700/30 bg-gray-800/10 p-5 text-sm text-gray-400">
         <div className="font-semibold text-gray-300 mb-2">About Mythic integration</div>

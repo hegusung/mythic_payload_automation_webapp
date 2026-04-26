@@ -6,6 +6,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.db.database import get_db
 from app.models.chain import ChainModel
 from app.models.settings import SettingsModel
@@ -49,13 +50,26 @@ def health():
 
 # ─── Settings ─────────────────────────────────────────────────────────────────
 
+def _effective_settings(db_data: dict) -> dict:
+    """Merge DB settings with .env fallbacks (DB wins if set)."""
+    return {
+        'mythic_url':           db_data.get('mythic_url')           or settings.mythic_url,
+        'mythic_username':      db_data.get('mythic_username')      or settings.mythic_username,
+        'mythic_password':      db_data.get('mythic_password')      or settings.mythic_password,
+        'payload_server_url':   db_data.get('payload_server_url')   or settings.payload_server_url,
+        'payload_server_token': db_data.get('payload_server_token') or settings.payload_server_token,
+    }
+
+
 @router.get('/settings', response_model=SettingsRead)
 def get_settings(db: Session = Depends(get_db)):
-    data = settings_service.get_all(db)
+    data = _effective_settings(settings_service.get_all(db))
     return SettingsRead(
         mythic_url=data.get('mythic_url'),
         mythic_username=data.get('mythic_username'),
         mythic_password_set=bool(data.get('mythic_password')),
+        payload_server_url=data.get('payload_server_url'),
+        payload_server_token_set=bool(data.get('payload_server_token')),
     )
 
 
@@ -63,16 +77,20 @@ def get_settings(db: Session = Depends(get_db)):
 def update_settings(payload: SettingsWrite, db: Session = Depends(get_db)):
     current = settings_service.get_all(db)
     update_data: dict[str, str | None] = {
-        'mythic_url': payload.mythic_url,
-        'mythic_username': payload.mythic_username,
-        'mythic_password': payload.mythic_password if payload.mythic_password is not None else current.get('mythic_password'),
+        'mythic_url':           payload.mythic_url,
+        'mythic_username':      payload.mythic_username,
+        'mythic_password':      payload.mythic_password      if payload.mythic_password      is not None else current.get('mythic_password'),
+        'payload_server_url':   payload.payload_server_url,
+        'payload_server_token': payload.payload_server_token if payload.payload_server_token is not None else current.get('payload_server_token'),
     }
     settings_service.set_all(db, update_data)
-    updated = settings_service.get_all(db)
+    updated = _effective_settings(settings_service.get_all(db))
     return SettingsRead(
         mythic_url=updated.get('mythic_url'),
         mythic_username=updated.get('mythic_username'),
         mythic_password_set=bool(updated.get('mythic_password')),
+        payload_server_url=updated.get('payload_server_url'),
+        payload_server_token_set=bool(updated.get('payload_server_token')),
     )
 
 
@@ -710,8 +728,9 @@ async def list_c2profiles(db: Session = Depends(get_db)):
 
 # ─── Components ───────────────────────────────────────────────────────────────
 
-@router.get('/components', response_model=ComponentsResponse)
+@router.get('/components')
 async def components(db: Session = Depends(get_db)):
+    from fastapi.responses import JSONResponse
     from app.core.config import settings as app_settings
     from app.services.component_catalog import FALLBACK_COMPONENTS
 
@@ -720,21 +739,24 @@ async def components(db: Session = Depends(get_db)):
     mythic_username = stored.get('mythic_username') or app_settings.mythic_username
     mythic_password = stored.get('mythic_password') or app_settings.mythic_password
 
+    no_cache_headers = {'Cache-Control': 'no-store, no-cache, must-revalidate'}
+
     if mythic_url and mythic_username and mythic_password:
         try:
             source, comps, warnings = await fetch_components_with_creds(
                 mythic_url, mythic_username, mythic_password
             )
-            return ComponentsResponse(source=source, components=comps, warnings=warnings)
+            resp = ComponentsResponse(source=source, components=comps, warnings=warnings)
         except MythicCatalogError as exc:
-            # Fallback gracefully
-            return ComponentsResponse(source='fallback', components=FALLBACK_COMPONENTS, warnings=[str(exc)])
+            resp = ComponentsResponse(source='fallback', components=FALLBACK_COMPONENTS, warnings=[str(exc)])
+    else:
+        try:
+            source, comps, warnings = await fetch_components()
+            resp = ComponentsResponse(source=source, components=comps, warnings=warnings)
+        except MythicCatalogError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    try:
-        source, comps, warnings = await fetch_components()
-        return ComponentsResponse(source=source, components=comps, warnings=warnings)
-    except MythicCatalogError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return JSONResponse(content=resp.model_dump(), headers=no_cache_headers)
 
 
 @router.get('/components/debug', response_model=ComponentCatalogDebugResponse)

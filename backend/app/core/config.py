@@ -8,6 +8,8 @@ class Settings(BaseSettings):
     mythic_url: str | None = None
     mythic_username: str | None = None
     mythic_password: str | None = None
+    payload_server_url: str | None = None
+    payload_server_token: str | None = None
     cors_origins: list[str] = ['*']
     model_config = SettingsConfigDict(env_file='.env', env_file_encoding='utf-8', extra='ignore')
 

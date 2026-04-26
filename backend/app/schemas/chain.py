@@ -185,6 +185,13 @@ class BuildParameterDefinition(BaseModel):
     choices: list[Any] = Field(default_factory=list)
 
 
+class CommandDefinition(BaseModel):
+    cmd: str
+    description: str = ''
+    needs_admin: bool = False
+    supported_ui_features: list[str] = Field(default_factory=list)
+
+
 class ComponentDefinition(BaseModel):
     type: str
     stage_type: str  # 'base', 'wrapper', 'downloader'
@@ -198,6 +205,7 @@ class ComponentDefinition(BaseModel):
     example_parameters: dict[str, Any] = Field(default_factory=dict)
     build_parameters_metadata: list[BuildParameterDefinition] = Field(default_factory=list)
     default_commands: list[str] = Field(default_factory=list)
+    available_commands: list[CommandDefinition] = Field(default_factory=list)
     default_c2_profile: dict[str, Any] | None = None
     example_c2_profiles: list[dict[str, Any]] = Field(default_factory=list)
     available_c2_profiles: list[str] = Field(default_factory=list)
@@ -220,12 +228,16 @@ class SettingsRead(BaseModel):
     mythic_url: str | None = None
     mythic_username: str | None = None
     mythic_password_set: bool = False
+    payload_server_url: str | None = None
+    payload_server_token_set: bool = False
 
 
 class SettingsWrite(BaseModel):
     mythic_url: str | None = None
     mythic_username: str | None = None
     mythic_password: str | None = None
+    payload_server_url: str | None = None
+    payload_server_token: str | None = None
 
 
 class ConnectionTestResult(BaseModel):

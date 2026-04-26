@@ -9,10 +9,11 @@ services:
       MYTHIC_URL: ${MYTHIC_URL:-}
       MYTHIC_USERNAME: ${MYTHIC_USERNAME:-}
       MYTHIC_PASSWORD: ${MYTHIC_PASSWORD:-}
+      PAYLOAD_SERVER_URL: ${PAYLOAD_SERVER_URL:-}
+      PAYLOAD_SERVER_TOKEN: ${PAYLOAD_SERVER_TOKEN:-}
     volumes:
       - backend_data:/data
-    ports:
-      - "127.0.0.1:7081:8000"
+    network_mode: host
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
       interval: 10s
@@ -28,8 +29,7 @@ services:
     depends_on:
       backend:
         condition: service_healthy
-    ports:
-      - "0.0.0.0:7080:80"
+    network_mode: host
     restart: unless-stopped
 
 volumes:

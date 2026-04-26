@@ -223,14 +223,14 @@ export default function ChainMythicPayloads({ chainId, chainName }) {
           disabled={loading}
           className="px-4 py-2 rounded-lg bg-gray-700/40 hover:bg-gray-600/40 text-gray-200 text-sm font-medium border border-gray-600/30 disabled:opacity-50 transition"
         >
-          {loading ? '↻ Chargement…' : '↻ Voir les payloads dans Mythic'}
+          {loading ? '↻ Loading…' : '↻ View Mythic payloads'}
         </button>
         <button
           onClick={handleDeploy}
           disabled={deploying}
           className="px-4 py-2 rounded-lg bg-red-700/30 hover:bg-red-700/50 text-red-200 text-sm font-medium border border-red-700/40 disabled:opacity-50 transition"
         >
-          {deploying ? '⚡ Déploiement…' : '⚡ Déployer dans Mythic'}
+          {deploying ? '⚡ Deploying…' : '⚡ Deploy'}
         </button>
         {data?.payloads?.length > 0 && (
           <button

@@ -119,6 +119,12 @@ query GetPayloadTypes {
       verifier_regex
       choices
     }
+    commands(order_by: {cmd: asc}) {
+      cmd
+      description
+      needs_admin
+      supported_ui_features
+    }
     payloadtypec2profiles {
       c2profile {
         name
@@ -366,6 +372,23 @@ def _build_components_from_payload_types(payload_types: list[dict[str, Any]]) ->
         available_c2_profiles, example_c2_profiles, c2_profiles_metadata = _build_c2_profile_examples(item)
         build_parameters_metadata = _build_build_parameter_metadata(item)
 
+        # Commands (base payloads only)
+        available_commands = []
+        default_commands_list = []
+        if not is_wrapper:
+            from app.schemas.chain import CommandDefinition
+            for cmd in (item.get('commands') or []):
+                cmd_name = cmd.get('cmd', '')
+                if not cmd_name:
+                    continue
+                available_commands.append(CommandDefinition(
+                    cmd=cmd_name,
+                    description=cmd.get('description') or '',
+                    needs_admin=bool(cmd.get('needs_admin')),
+                    supported_ui_features=cmd.get('supported_ui_features') or [],
+                ))
+                default_commands_list.append(cmd_name)
+
         components.append(
             ComponentDefinition(
                 type=name,
@@ -379,6 +402,8 @@ def _build_components_from_payload_types(payload_types: list[dict[str, Any]]) ->
                 default_parameters=example_parameters,
                 example_parameters=example_parameters,
                 build_parameters_metadata=build_parameters_metadata,
+                available_commands=available_commands,
+                default_commands=default_commands_list,
                 default_c2_profile=deepcopy(example_c2_profiles[0]) if example_c2_profiles else None,
                 example_c2_profiles=example_c2_profiles,
                 available_c2_profiles=available_c2_profiles,

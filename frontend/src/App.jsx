@@ -38,8 +38,8 @@ export default function App() {
   }
 
   const handleSavedChain = (saved) => {
-    // After save, show the chain list
-    setEditingChain(null)
+    // Stay on the editor after save
+    setEditingChain(c => ({ ...c, id: saved.id }))
   }
 
   return (

@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from app.models.settings import SettingsModel
 
 
-SETTING_KEYS = ('mythic_url', 'mythic_username', 'mythic_password')
+SETTING_KEYS = ('mythic_url', 'mythic_username', 'mythic_password', 'payload_server_url', 'payload_server_token')
 
 
 def get_all(db: Session) -> dict[str, str | None]:

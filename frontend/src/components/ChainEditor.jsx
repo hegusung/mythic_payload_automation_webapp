@@ -294,6 +294,101 @@ function VariablesEditor({ variables, onChange }) {
 }
 
 
+function CommandsSection({ commands, availableCommands, onChange }) {
+  const [cmdInput, setCmdInput] = useState('')
+  const selected = new Set(commands)
+
+  const toggle = (cmd) => {
+    const next = new Set(selected)
+    if (next.has(cmd)) next.delete(cmd)
+    else next.add(cmd)
+    onChange([...next].sort())
+  }
+
+  const selectAll = () => onChange(availableCommands.map(c => c.cmd).sort())
+  const selectNone = () => onChange([])
+
+  const addCustom = () => {
+    if (!cmdInput.trim()) return
+    const next = new Set(selected)
+    next.add(cmdInput.trim())
+    onChange([...next].sort())
+    setCmdInput('')
+  }
+
+  const hasAvailable = availableCommands.length > 0
+
+  return (
+    <div>
+      <div className="flex items-center gap-3 mb-2">
+        <label className="text-xs text-gray-500">Commands</label>
+        <span className="text-xs text-gray-600">{selected.size} / {hasAvailable ? availableCommands.length : '?'} selected</span>
+        {hasAvailable && (
+          <>
+            <button onClick={selectAll} className="text-xs text-blue-400 hover:text-blue-300">All</button>
+            <button onClick={selectNone} className="text-xs text-gray-500 hover:text-gray-300">None</button>
+          </>
+        )}
+      </div>
+
+      {hasAvailable ? (
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-1 max-h-56 overflow-y-auto pr-1 mb-2">
+          {availableCommands.map(c => {
+            const on = selected.has(c.cmd)
+            return (
+              <label
+                key={c.cmd}
+                title={[c.description, c.needs_admin ? '(needs admin)' : ''].filter(Boolean).join(' — ')}
+                className={`flex items-center gap-1.5 px-2 py-1 rounded cursor-pointer border transition text-xs ${
+                  on
+                    ? 'bg-blue-900/30 border-blue-700/40 text-blue-200'
+                    : 'bg-gray-800/40 border-gray-700/20 text-gray-400 hover:border-gray-500/40'
+                }`}
+              >
+                <input
+                  type="checkbox"
+                  checked={on}
+                  onChange={() => toggle(c.cmd)}
+                  className="accent-blue-500 shrink-0"
+                />
+                <span className="font-mono truncate">{c.cmd}</span>
+                {c.needs_admin && <span className="text-red-400 shrink-0" title="Needs admin">⚠️</span>}
+              </label>
+            )
+          })}
+        </div>
+      ) : (
+        // Fallback: Mythic not connected or commands not loaded — show tags
+        <div className="flex flex-wrap gap-1.5 mb-2">
+          {[...selected].map(cmd => (
+            <CommandTag key={cmd} cmd={cmd} onRemove={() => {
+              const next = new Set(selected)
+              next.delete(cmd)
+              onChange([...next])
+            }} />
+          ))}
+        </div>
+      )}
+
+      {/* Custom command input (always shown) */}
+      <div className="flex gap-2 mt-1">
+        <input
+          value={cmdInput}
+          onChange={e => setCmdInput(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && addCustom()}
+          placeholder={hasAvailable ? 'Add unlisted command…' : 'Add command…'}
+          className="flex-1 bg-gray-900/60 border border-gray-600/30 rounded px-2.5 py-1 text-xs text-gray-100 focus:outline-none focus:border-blue-500/60"
+        />
+        <button onClick={addCustom}
+          className="px-3 py-1 rounded bg-gray-700/40 hover:bg-gray-600/40 text-gray-300 text-xs border border-gray-600/30 transition">
+          Add
+        </button>
+      </div>
+    </div>
+  )
+}
+
+
 function ParametersSection({ parameters, buildParamsMeta, onChange }) {
   const [newKey, setNewKey] = useState('')
   const [newVal, setNewVal] = useState('')
@@ -304,6 +399,15 @@ function ParametersSection({ parameters, buildParamsMeta, onChange }) {
   // Split: known params (have metadata) vs extra params added manually
   const knownParams = (buildParamsMeta || []).filter(m => m.name in parameters)
   const extraParams = Object.entries(parameters).filter(([k]) => !knownKeys.has(k))
+  const orphanCount = extraParams.filter(([k]) => !k.startsWith('downloader_')).length
+
+  const syncWithMythic = () => {
+    // Remove orphan params (not in Mythic meta, not downloader_* specials)
+    const cleaned = Object.fromEntries(
+      Object.entries(parameters).filter(([k]) => knownKeys.has(k) || k.startsWith('downloader_'))
+    )
+    onChange(cleaned)
+  }
   // Known params not yet in parameters (available to add)
   const availableToAdd = (buildParamsMeta || []).filter(m => !(m.name in parameters))
 
@@ -318,7 +422,18 @@ function ParametersSection({ parameters, buildParamsMeta, onChange }) {
 
   return (
     <div>
-      <label className="block text-xs text-gray-500 mb-2">Parameters</label>
+      <div className="flex items-center justify-between mb-2">
+        <label className="text-xs text-gray-500">Parameters</label>
+        {orphanCount > 0 && (
+          <button
+            onClick={syncWithMythic}
+            className="text-xs text-amber-400 hover:text-amber-300 border border-amber-700/40 hover:border-amber-500/60 rounded px-2 py-0.5 transition"
+            title="Remove parameters that no longer exist in Mythic"
+          >
+            ⚠ Sync with Mythic ({orphanCount} orphan{orphanCount > 1 ? 's' : ''})
+          </button>
+        )}
+      </div>
       <div className="space-y-2">
         {/* Known typed params */}
         {knownParams.map(meta => (
@@ -332,17 +447,30 @@ function ParametersSection({ parameters, buildParamsMeta, onChange }) {
           />
         ))}
 
-        {/* Extra manual params */}
-        {extraParams.map(([key, val]) => (
-          <TypedParamField
-            key={key}
-            name={key}
-            value={val}
-            meta={null}
-            onChange={v => updateParam(key, v)}
-            onRemove={() => removeParam(key)}
-          />
-        ))}
+        {/* Extra / orphan params — split between downloader_* specials and unknown */}
+        {extraParams.map(([key, val]) => {
+          const isSpecial = key.startsWith('downloader_')
+          return (
+            <div key={key}>
+              {!isSpecial && (
+                <div className="flex items-center gap-1.5 mb-0.5">
+                  <span className="text-xs text-amber-500/80 font-mono">⚠ not in Mythic</span>
+                  <button
+                    onClick={() => removeParam(key)}
+                    className="text-xs text-red-500 hover:text-red-400 underline"
+                  >remove</button>
+                </div>
+              )}
+              <TypedParamField
+                name={key}
+                value={val}
+                meta={null}
+                onChange={v => updateParam(key, v)}
+                onRemove={() => removeParam(key)}
+              />
+            </div>
+          )
+        })}
       </div>
 
       {/* Add known param that was removed */}
@@ -389,7 +517,7 @@ function ParametersSection({ parameters, buildParamsMeta, onChange }) {
 
 // ── Stage Card ────────────────────────────────────────────────────────────────
 
-function StageCard({ node, index, total, components, c2Profiles, allNodes, onChange, onRemove, onMoveUp, onMoveDown }) {
+function StageCard({ node, index, total, components, c2Profiles, allNodes, onChange, onRemove, onMoveUp, onMoveDown, payloadServerUrl }) {
   const [cmdInput, setCmdInput] = useState('')
   const [collapsed, setCollapsed] = useState(true)
 
@@ -641,10 +769,15 @@ function StageCard({ node, index, total, components, c2Profiles, allNodes, onCha
                 className="w-full bg-gray-900/60 border border-gray-600/30 rounded px-2.5 py-1.5 text-sm text-gray-100 focus:outline-none focus:border-orange-500/60"
               >
                 <option value="">— Select C2 —</option>
+                <option value="payload-server">📦 payload-server</option>
+                {c2Profiles.length > 0 && <option disabled>──────────────</option>}
                 {c2Profiles.map(p => (
                   <option key={p} value={p}>{p}</option>
                 ))}
               </select>
+              {d.c2_profile === 'payload-server' && !payloadServerUrl && (
+                <p className="text-xs text-yellow-500/80 mt-1">⚠️ payload-server URL not configured in Settings</p>
+              )}
             </div>
             <div>
               <label className="block text-xs text-gray-500 mb-1">Base URL</label>
@@ -707,33 +840,11 @@ function StageCard({ node, index, total, components, c2Profiles, allNodes, onCha
 
       {/* Commands (base only) */}
       {!collapsed && d.stage_type === 'base' && (
-        <div>
-          <label className="block text-xs text-gray-500 mb-1.5">Commands</label>
-          <div className="flex flex-wrap gap-1.5 mb-2">
-            {d.commands.map(cmd => (
-              <CommandTag
-                key={cmd}
-                cmd={cmd}
-                onRemove={() => update({ commands: d.commands.filter(c => c !== cmd) })}
-              />
-            ))}
-          </div>
-          <div className="flex gap-2">
-            <input
-              value={cmdInput}
-              onChange={e => setCmdInput(e.target.value)}
-              onKeyDown={e => e.key === 'Enter' && addCmd()}
-              placeholder="Add command…"
-              className="flex-1 bg-gray-900/60 border border-gray-600/30 rounded px-2.5 py-1 text-xs text-gray-100 focus:outline-none focus:border-blue-500/60"
-            />
-            <button
-              onClick={addCmd}
-              className="px-3 py-1 rounded bg-gray-700/40 hover:bg-gray-600/40 text-gray-300 text-xs border border-gray-600/30 transition"
-            >
-              Add
-            </button>
-          </div>
-        </div>
+        <CommandsSection
+          commands={d.commands}
+          availableCommands={comp?.available_commands || []}
+          onChange={cmds => update({ commands: cmds })}
+        />
       )}
 
       {/* Parameters — for downloaders, hide the url_parameter (auto-managed) */}
@@ -779,14 +890,22 @@ export default function ChainEditor({ chain, onBack, onSaved }) {
   const [savedChainId, setSavedChainId] = useState(chain?.id || null)
   const validateTimeout = useRef(null)
 
+  const [syncingMythic, setSyncingMythic] = useState(false)
+  const [payloadServerUrl, setPayloadServerUrl] = useState('')
+
   // Load components + C2 profiles
+  const refreshComponents = () => {
+    setSyncingMythic(true)
+    Promise.all([
+      api.getComponents().then(data => setComponents(data.components || [])),
+      api.getC2Profiles().then(data => setC2Profiles((data.profiles || []).map(p => p.name))),
+    ])
+      .catch(() => {})
+      .finally(() => setSyncingMythic(false))
+  }
   useEffect(() => {
-    api.getComponents()
-      .then(data => setComponents(data.components || []))
-      .catch(() => {})
-    api.getC2Profiles()
-      .then(data => setC2Profiles((data.profiles || []).map(p => p.name)))
-      .catch(() => {})
+    refreshComponents()
+    api.getSettings().then(s => setPayloadServerUrl(s.payload_server_url || '')).catch(() => {})
   }, [])
 
   // Auto-validate graph on change
@@ -925,6 +1044,14 @@ export default function ChainEditor({ chain, onBack, onSaved }) {
           {chain?.id ? `Edit: ${name || '(unnamed)'}` : 'New Chain'}
         </h2>
         <button
+          onClick={refreshComponents}
+          disabled={syncingMythic}
+          title="Reload payload types from Mythic"
+          className="px-3 py-1.5 rounded-lg bg-gray-700/40 hover:bg-gray-600/40 text-gray-400 hover:text-gray-200 text-xs font-medium border border-gray-600/30 transition shrink-0 disabled:opacity-50"
+        >
+          {syncingMythic ? '↻ Syncing…' : '↻ Sync Mythic'}
+        </button>
+        <button
           onClick={handleExport}
           className="px-3 py-1.5 rounded-lg bg-gray-700/40 hover:bg-gray-600/40 text-gray-200 text-xs font-medium border border-gray-600/30 transition shrink-0"
         >
@@ -1039,6 +1166,7 @@ export default function ChainEditor({ chain, onBack, onSaved }) {
                     onRemove={() => removeStage(node.id)}
                     onMoveUp={() => moveUp(i)}
                     onMoveDown={() => moveDown(i)}
+                    payloadServerUrl={payloadServerUrl}
                   />
                 ))
               )}
