@@ -131,13 +131,59 @@ async def test_connection(payload: SettingsWrite, db: Session = Depends(get_db))
         return ConnectionTestResult(ok=False, message=f'Connection failed: {exc}')
 
 
+from pydantic import BaseModel as _BaseModel
+class PayloadServerTestIn(_BaseModel):
+    payload_server_url: str | None = None
+    payload_server_token: str | None = None
+
+
+@router.post('/settings/test-payload-server', response_model=ConnectionTestResult)
+async def test_payload_server(payload: PayloadServerTestIn, db: Session = Depends(get_db)):
+    import httpx
+    url = payload.payload_server_url
+    token = payload.payload_server_token
+
+    # Fallback to stored values if not provided
+    if not url or not token:
+        stored = _effective_settings(settings_service.get_all(db))
+        url = url or stored.get('payload_server_url')
+        token = token or stored.get('payload_server_token')
+
+    if not url:
+        return ConnectionTestResult(ok=False, message='Payload server URL is required.')
+    if not token:
+        return ConnectionTestResult(ok=False, message='Payload server token is required.')
+
+    try:
+        health_url = url.rstrip('/') + '/api/health'
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(health_url)
+        if r.status_code != 200:
+            return ConnectionTestResult(ok=False, message=f'Health check returned HTTP {r.status_code}.')
+
+        # Verify token by hitting a protected endpoint
+        files_url = url.rstrip('/') + '/api/files'
+        async with httpx.AsyncClient(timeout=5) as client:
+            r2 = await client.get(files_url, headers={'X-Token': token})
+        if r2.status_code == 401:
+            return ConnectionTestResult(ok=False, message='Server reachable but token is invalid (401).')
+        if not r2.is_success:
+            return ConnectionTestResult(ok=False, message=f'Auth check returned HTTP {r2.status_code}.')
+
+        return ConnectionTestResult(ok=True, message='Connected successfully to payload-server.')
+    except httpx.ConnectError:
+        return ConnectionTestResult(ok=False, message=f'Cannot reach {url} — connection refused.')
+    except httpx.TimeoutException:
+        return ConnectionTestResult(ok=False, message=f'Connection to {url} timed out.')
+    except Exception as exc:
+        return ConnectionTestResult(ok=False, message=f'Connection failed: {exc}')
+
+
 # ─── Stats ────────────────────────────────────────────────────────────────────
 
 @router.get('/stats', response_model=StatsResponse)
 async def stats(db: Session = Depends(get_db)):
-    # Try to get live components; if Mythic not configured, use fallback
     from app.core.config import settings as app_settings
-    from app.services.component_catalog import FALLBACK_COMPONENTS
 
     stored = settings_service.get_all(db)
     mythic_url = stored.get('mythic_url') or app_settings.mythic_url
@@ -145,8 +191,8 @@ async def stats(db: Session = Depends(get_db)):
     mythic_password = stored.get('mythic_password') or app_settings.mythic_password
 
     warnings: list[str] = []
-    source = 'fallback'
-    components = FALLBACK_COMPONENTS
+    source = 'not_configured'
+    components = []
 
     if mythic_url and mythic_username and mythic_password:
         try:
@@ -155,8 +201,7 @@ async def stats(db: Session = Depends(get_db)):
             )
         except MythicCatalogError as exc:
             warnings.append(str(exc))
-            source = 'fallback'
-            components = FALLBACK_COMPONENTS
+            source = 'error' 
 
     os_distribution: dict[str, int] = {}
     base_count = 0
@@ -171,9 +216,7 @@ async def stats(db: Session = Depends(get_db)):
         else:
             base_count += 1
 
-        # container_running is buried in description for fallback components
-        # For live components, it comes from Mythic
-        is_running = True  # fallback components assumed running
+        is_running = True
         if 'container stopped' in (comp.description or '').lower():
             is_running = False
         if is_running:
@@ -732,7 +775,6 @@ async def list_c2profiles(db: Session = Depends(get_db)):
 async def components(db: Session = Depends(get_db)):
     from fastapi.responses import JSONResponse
     from app.core.config import settings as app_settings
-    from app.services.component_catalog import FALLBACK_COMPONENTS
 
     stored = settings_service.get_all(db)
     mythic_url = stored.get('mythic_url') or app_settings.mythic_url
@@ -748,7 +790,7 @@ async def components(db: Session = Depends(get_db)):
             )
             resp = ComponentsResponse(source=source, components=comps, warnings=warnings)
         except MythicCatalogError as exc:
-            resp = ComponentsResponse(source='fallback', components=FALLBACK_COMPONENTS, warnings=[str(exc)])
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
     else:
         try:
             source, comps, warnings = await fetch_components()

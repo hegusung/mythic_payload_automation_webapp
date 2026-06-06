@@ -27,6 +27,7 @@ export const api = {
   getSettings: () => request('GET', '/settings'),
   updateSettings: (data) => request('PUT', '/settings', data),
   testConnection: (data) => request('POST', '/settings/test', data),
+  testPayloadServer: (data) => request('POST', '/settings/test-payload-server', data),
 
   // Components / payload types
   getComponents: () => request('GET', '/components'),
@@ -67,5 +68,4 @@ export const api = {
   getPayloadDownloadUrl: (agentFileId, filename) => `${BASE}/payloads/${agentFileId}/download${filename ? '?filename=' + encodeURIComponent(filename) : ''}`,
 
   // Samples
-  getSamples: () => request('GET', '/samples'),
 }

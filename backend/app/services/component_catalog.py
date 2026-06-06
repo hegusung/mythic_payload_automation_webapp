@@ -38,47 +38,6 @@ def _get_c2_profile_parameter_template(name: str | None) -> dict[str, Any]:
     return deepcopy(KNOWN_C2_PROFILE_TEMPLATES.get(str(name).lower(), {}))
 
 
-FALLBACK_COMPONENTS = [
-    ComponentDefinition(
-        type='apollo', stage_type='base', label='Apollo', description='Mythic Apollo payload',
-        default_parameters={'debug': False, 'adjust_filename': False, 'shellcode_bypass': 'Continue on fail', 'shellcode_format': 'Binary', 'output_type': 'WinExe'},
-        example_parameters={'debug': False, 'adjust_filename': False, 'shellcode_bypass': 'Continue on fail', 'shellcode_format': 'Binary', 'output_type': 'WinExe'},
-        default_commands=['exit', 'register_file', 'download', 'load', 'ps', 'run', 'shell', 'upload', 'wmiexecute'],
-        default_c2_profile={
-            'c2_profile': 'http',
-            'c2_profile_parameters': _get_c2_profile_parameter_template('http')
-        },
-        example_c2_profiles=[
-            {
-                'c2_profile': 'http',
-                'c2_profile_parameters': _get_c2_profile_parameter_template('http')
-            }
-        ],
-        available_c2_profiles=['http'],
-        c2_profiles_metadata=[
-            C2ProfileDefinition(
-                name='http',
-                description='Fallback HTTP C2 template bundled with the app when live Mythic metadata is unavailable.',
-                parameters=[
-                    C2ProfileParameterDefinition(name='callback_host', parameter_type='String', default_value='http://127.0.0.1', default_value_decoded='http://127.0.0.1', required=True),
-                    C2ProfileParameterDefinition(name='callback_port', parameter_type='Number', default_value='80', default_value_decoded=80),
-                    C2ProfileParameterDefinition(name='callback_interval', parameter_type='Number', default_value='10', default_value_decoded=10),
-                    C2ProfileParameterDefinition(name='callback_jitter', parameter_type='Number', default_value='23', default_value_decoded=23),
-                    C2ProfileParameterDefinition(name='AESPSK', parameter_type='ChooseOne', default_value='aes256_hmac', default_value_decoded='aes256_hmac', choices=['aes256_hmac']),
-                ],
-            )
-        ],
-    ),
-    ComponentDefinition(type='psh_wraps_shellcode', stage_type='wrapper', label='PowerShell wraps shellcode', description='Wrap a payload inside PowerShell shellcode', supports_wrapper=True),
-    ComponentDefinition(type='psh_remote_psh', stage_type='downloader', label='PowerShell remote PSH', description='Download and execute a remote PowerShell script', supports_downloader=True, default_parameters={}, example_parameters={}),
-    ComponentDefinition(type='cmd_wraps_powershell', stage_type='wrapper', label='CMD wraps PowerShell', description='Wrap a PS1 payload inside a .cmd launcher', supports_wrapper=True, default_parameters={'mode': 'inline'}, example_parameters={'mode': 'inline'}),
-    ComponentDefinition(type='lnk_wraps_cmd', stage_type='wrapper', label='LNK wraps CMD', description='Create a .lnk shortcut that launches a command', supports_wrapper=True, default_parameters={'description': 'Click me plz', 'icon_file': 'C:\\Windows\\System32\\WSReset.exe', 'window_mode': 'Minimized', 'word_dir': 'C:\\'}, example_parameters={'description': 'Click me plz', 'icon_file': 'C:\\Windows\\System32\\WSReset.exe', 'window_mode': 'Minimized', 'word_dir': 'C:\\'}),
-    ComponentDefinition(type='packmypayload', stage_type='wrapper', label='Archive packer', description='Wrap a payload inside an archive', supports_wrapper=True, default_parameters={'archive_type': 'zip', 'password': '', 'payload_name': 'payload.bin', 'file1': 'space.jpg', 'file1_content': 'file:image.jpg'}, example_parameters={'archive_type': 'zip', 'password': '', 'payload_name': 'payload.bin', 'file1': 'space.jpg', 'file1_content': 'file:image.jpg'}),
-    ComponentDefinition(type='jscript_download_save_execute', stage_type='downloader', label='JScript download+exec', description='Download an executable and launch it through JScript', supports_downloader=True, default_parameters={'download_method': 'Msxml2.XMLHTTP', 'exec_method': 'WScript.Shell_Run', 'path': '%APPDATA%\\sample.exe'}, example_parameters={'download_method': 'Msxml2.XMLHTTP', 'exec_method': 'WScript.Shell_Run', 'path': '%APPDATA%\\sample.exe'}),
-    ComponentDefinition(type='sct_wraps_script', stage_type='wrapper', label='SCT wraps script', description='Wrap a script inside an SCT container', supports_wrapper=True, default_parameters={'progid': 'trustmebro', 'classid': '{F000F000-0000-0000-0000-000000000001}'}, example_parameters={'progid': 'trustmebro', 'classid': '{F000F000-0000-0000-0000-000000000001}'}),
-    ComponentDefinition(type='cmd_regsvr32_remote_sct', stage_type='downloader', label='CMD regsvr32 remote SCT', description='Launch regsvr32 against a remote SCT', supports_downloader=True, default_parameters={}, example_parameters={}),
-    ComponentDefinition(type='clickfix', stage_type='wrapper', label='ClickFix HTML', description='ClickFix social-engineering HTML page', supports_wrapper=True),
-]
 
 
 BASIC_PAYLOAD_QUERY = """
@@ -435,12 +394,10 @@ def _build_build_parameter_metadata(item: dict[str, Any]) -> list[BuildParameter
 async def fetch_components() -> tuple[str, list[ComponentDefinition], list[str]]:
     warnings: list[str] = []
     if not settings.mythic_url:
-        warnings.append('MYTHIC_URL is not configured. Using the local catalog.')
-        return 'fallback', FALLBACK_COMPONENTS, warnings
+        raise MythicCatalogError('Mythic is not configured. Set MYTHIC_URL in Settings.')
 
     if not settings.mythic_username or not settings.mythic_password:
-        warnings.append('Mythic credentials are incomplete. Using the local catalog.')
-        return 'fallback', FALLBACK_COMPONENTS, warnings
+        raise MythicCatalogError('Mythic credentials are incomplete. Configure username and password in Settings.')
 
     try:
         payload_types, metadata_warnings = await _fetch_payload_types_from_mythic()
@@ -451,7 +408,7 @@ async def fetch_components() -> tuple[str, list[ComponentDefinition], list[str]]
     components = _build_components_from_payload_types(payload_types)
 
     if not components:
-        raise MythicCatalogError('Mythic returned an empty payload catalog. Local fallback stays disabled when MYTHIC_URL is configured.')
+        raise MythicCatalogError('Mythic returned an empty payload catalog.')
 
     return 'mythic', components, warnings
 
@@ -504,12 +461,10 @@ async def fetch_components_with_creds(
 async def fetch_component_catalog_debug() -> tuple[str, list[dict[str, Any]], list[str]]:
     warnings: list[str] = []
     if not settings.mythic_url:
-        warnings.append('MYTHIC_URL is not configured. No live Mythic schema inspection is possible.')
-        return 'fallback', [], warnings
+        raise MythicCatalogError('Mythic is not configured. Set MYTHIC_URL in Settings.')
 
     if not settings.mythic_username or not settings.mythic_password:
-        warnings.append('Mythic credentials are incomplete. No live Mythic schema inspection is possible.')
-        return 'fallback', [], warnings
+        raise MythicCatalogError('Mythic credentials are incomplete. Configure username and password in Settings.')
 
     try:
         payload_types, metadata_warnings = await _fetch_payload_types_from_mythic()

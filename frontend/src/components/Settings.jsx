@@ -11,6 +11,9 @@ export default function Settings() {
   const [saving, setSaving] = useState(false)
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState(null)
+  const [savingPs, setSavingPs] = useState(false)
+  const [testingPs, setTestingPs] = useState(false)
+  const [testResultPs, setTestResultPs] = useState(null)
 
   useEffect(() => {
     api.getSettings()
@@ -36,18 +39,52 @@ export default function Settings() {
         mythic_url: form.mythic_url || null,
         mythic_username: form.mythic_username || null,
         mythic_password: form.mythic_password || null,
-        payload_server_url: form.payload_server_url || null,
-        payload_server_token: form.payload_server_token || null,
       }
       const data = await api.updateSettings(payload)
       setPasswordSet(data.mythic_password_set)
-      setPsTokenSet(data.payload_server_token_set)
-      setForm(f => ({ ...f, mythic_password: '', payload_server_token: '' }))
-      showToast('Settings saved.', 'success')
+      setForm(f => ({ ...f, mythic_password: '' }))
+      showToast('Mythic settings saved.', 'success')
     } catch (e) {
       showToast(`Save failed: ${e.message}`, 'error')
     } finally {
       setSaving(false)
+    }
+  }
+
+  const handleSavePs = async () => {
+    setSavingPs(true)
+    try {
+      const payload = {
+        payload_server_url: form.payload_server_url || null,
+        payload_server_token: form.payload_server_token || null,
+      }
+      const data = await api.updateSettings(payload)
+      setPsTokenSet(data.payload_server_token_set)
+      setForm(f => ({ ...f, payload_server_token: '' }))
+      showToast('Payload server settings saved.', 'success')
+    } catch (e) {
+      showToast(`Save failed: ${e.message}`, 'error')
+    } finally {
+      setSavingPs(false)
+    }
+  }
+
+  const handleTestPs = async () => {
+    setTestingPs(true)
+    setTestResultPs(null)
+    try {
+      const payload = {
+        payload_server_url: form.payload_server_url || null,
+        payload_server_token: form.payload_server_token || null,
+      }
+      const result = await api.testPayloadServer(payload)
+      setTestResultPs(result)
+      showToast(result.message, result.ok ? 'success' : 'error')
+    } catch (e) {
+      setTestResultPs({ ok: false, message: e.message })
+      showToast(`Test failed: ${e.message}`, 'error')
+    } finally {
+      setTestingPs(false)
     }
   }
 
@@ -192,6 +229,34 @@ export default function Settings() {
             />
           </div>
         </div>
+
+        {testResultPs && (
+          <div className={`rounded-lg px-4 py-3 text-sm border ${
+            testResultPs.ok
+              ? 'bg-green-900/20 border-green-700/40 text-green-300'
+              : 'bg-red-900/20 border-red-700/40 text-red-300'
+          }`}>
+            <span className="font-semibold">{testResultPs.ok ? '✓ ' : '✗ '}</span>
+            {testResultPs.message}
+          </div>
+        )}
+
+        <div className="flex gap-3 pt-1">
+          <button
+            onClick={handleSavePs}
+            disabled={savingPs}
+            className="px-5 py-2.5 rounded-lg bg-orange-700 hover:bg-orange-600 disabled:bg-orange-900 disabled:cursor-not-allowed text-white text-sm font-medium transition"
+          >
+            {savingPs ? 'Saving…' : 'Save Settings'}
+          </button>
+          <button
+            onClick={handleTestPs}
+            disabled={testingPs}
+            className="px-5 py-2.5 rounded-lg bg-gray-700/50 hover:bg-gray-600/50 disabled:opacity-50 disabled:cursor-not-allowed text-gray-200 text-sm font-medium border border-gray-600/40 transition"
+          >
+            {testingPs ? 'Testing…' : 'Test Connection'}
+          </button>
+        </div>
       </div>
 
       <div className="rounded-xl border border-gray-700/30 bg-gray-800/10 p-5 text-sm text-gray-400">
@@ -199,7 +264,6 @@ export default function Settings() {
         <ul className="space-y-1.5 list-disc list-inside">
           <li>Settings are stored in the local SQLite database</li>
           <li>The password is stored as plaintext — use a dedicated local account</li>
-          <li>If Mythic is not configured, the app uses a local fallback catalog</li>
           <li>Default Mythic port: 7443 (HTTPS)</li>
         </ul>
       </div>

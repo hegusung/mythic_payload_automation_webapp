@@ -27,6 +27,7 @@ function StatusBadge({ running }) {
 
 export default function Dashboard({ onGoToSettings }) {
   const [stats, setStats] = useState(null)
+  const isNotConfigured = !stats || stats.source === 'not_configured' || stats.source === 'error'
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
 
@@ -61,7 +62,6 @@ export default function Dashboard({ onGoToSettings }) {
     )
   }
 
-  const isFallback = stats?.source === 'fallback'
 
   return (
     <div className="space-y-6">
@@ -69,11 +69,11 @@ export default function Dashboard({ onGoToSettings }) {
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <span className={`px-2 py-0.5 rounded text-xs font-medium border ${
-            isFallback
+            isNotConfigured
               ? 'bg-yellow-900/30 text-yellow-400 border-yellow-700/40'
               : 'bg-green-900/30 text-green-400 border-green-700/40'
           }`}>
-            {isFallback ? '⚠ Local catalog' : '✓ Live from Mythic'}
+            {'✓ Live from Mythic'}
           </span>
           {stats?.payload_types?.length > 0 && (
             <span className="text-xs text-gray-500">{stats.payload_types.length} payload type{stats.payload_types.length !== 1 ? 's' : ''}</span>
@@ -86,11 +86,11 @@ export default function Dashboard({ onGoToSettings }) {
           ↻ Refresh
         </button>
       </div>
-      {isFallback && (
+      {isNotConfigured && (
         <div className="flex items-center justify-between rounded-xl border border-yellow-700/40 bg-yellow-900/20 px-5 py-4">
           <div>
             <div className="font-semibold text-yellow-300">Mythic not connected</div>
-            <div className="text-sm text-yellow-500 mt-0.5">Showing local catalog data. Configure Mythic in Settings to see live data.</div>
+
           </div>
           <div className="flex gap-2 ml-4 shrink-0">
             <button
