@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 from collections import defaultdict
 from typing import Any
+
+_log = logging.getLogger(__name__)
 
 import gql
 from mythic import mythic, mythic_utilities
@@ -195,7 +198,7 @@ def _normalize_mythic_error(raw: Any, *, label: str, stage_type: str) -> str:
     if 'payload type' in lowered and ('not found' in lowered or 'unknown' in lowered):
         return f'{prefix} references a payload type that Mythic does not know about.'
     if 'c2' in lowered and ('profile' in lowered or 'parameter' in lowered):
-        return f'{prefix} has an invalid or incomplete C2 profile configuration for Mythic.'
+        return f'{prefix} has an invalid or incomplete C2 profile configuration for Mythic. Raw error: {text[:300]}'
     if 'bad type' in lowered or 'parameter_type' in lowered:
         return f'{prefix} has a parameter type mismatch: {text}'
     # Return raw text — better than generic message
@@ -245,52 +248,79 @@ async def _execute_mythic_call(operation, *, label: str, stage_type: str):
 
 
 async def _upload_local_files_to_mythic(parameters: dict[str, Any], mythic_client, db) -> dict[str, Any]:
-    """For any File parameter value that is a filename (not a UUID), upload it to Mythic.
-    - Skip null/empty values
-    - If a cached entry with the same sha256 already has a Mythic UUID → reuse it
-    - Otherwise upload and store the UUID
+    """For any File parameter that is a local:<sha256> ref or a plain filename, upload it to Mythic.
+    Always re-uploads if content is available to ensure the file exists on the current Mythic instance.
+    Falls back to cached UUID only if no content is available.
     """
-    import re, hashlib
+    import re
     _UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+    _LOCAL_RE = re.compile(r'^local:([0-9a-f]{64})$')
     if not parameters or db is None:
         return parameters
     from app.models.file_cache import FileCache
     resolved = dict(parameters)
     for key, val in parameters.items():
         if not isinstance(val, str) or not val or _UUID_RE.match(val):
-            continue  # already a UUID, empty, or non-string
-        # Look up by filename, prefer already-uploaded entries
-        cached = (
-            db.query(FileCache)
-            .filter(FileCache.filename == val)
-            .order_by(FileCache.mythic_file_uuid.desc())  # NULLs last
-            .first()
-        )
-        if not cached:
-            continue  # unknown value, not a file param, skip
-        # Deduplicate by sha256: look for any entry with same content already uploaded
-        if cached.sha256:
-            uploaded = (
+            continue  # already a Mythic UUID, empty, or non-string
+
+        # Resolve cache entry by local:<sha256> or plain filename
+        cached = None
+        local_match = _LOCAL_RE.match(val)
+        if local_match:
+            sha = local_match.group(1)
+            cached = db.query(FileCache).filter(FileCache.sha256 == sha).first()
+        else:
+            cached = (
                 db.query(FileCache)
-                .filter(FileCache.sha256 == cached.sha256, FileCache.mythic_file_uuid != None)  # noqa: E711
+                .filter(FileCache.filename == val)
+                .order_by(FileCache.mythic_file_uuid.desc())
                 .first()
             )
-            if uploaded:
-                resolved[key] = uploaded.mythic_file_uuid
-                continue
+
+        if not cached:
+            _log.warning('_upload_local_files: no cache entry for param %s=%r, skipping', key, val)
+            continue
+
+        if not cached.content:
+            if cached.mythic_file_uuid:
+                resolved[key] = cached.mythic_file_uuid
+            continue
+
+        # Check if the file still exists on Mythic before uploading
+        needs_upload = True
         if cached.mythic_file_uuid:
+            try:
+                check = await mythic_utilities.graphql_post(
+                    mythic=mythic_client,
+                    gql_query=gql.gql('query CheckFile($uuid: String!) { filemeta(where: {agent_file_id: {_eq: $uuid}, deleted: {_eq: false}}) { agent_file_id } }'),
+                    variables={'uuid': cached.mythic_file_uuid},
+                )
+                if (check.get('filemeta') or []):
+                    needs_upload = False
+            except Exception:
+                pass  # Can't check — re-upload to be safe
+
+        if not needs_upload:
             resolved[key] = cached.mythic_file_uuid
             continue
-        # Upload to Mythic
-        file_uuid = await mythic.register_file(
-            mythic=mythic_client,
-            filename=cached.filename,
-            contents=cached.content,
-        )
+
+        try:
+            file_uuid = await mythic.register_file(
+                mythic=mythic_client,
+                filename=cached.filename,
+                contents=cached.content,
+            )
+        except Exception as exc:
+            _log.error('_upload_local_files: register_file failed for %r: %s', cached.filename, exc)
+            if cached.mythic_file_uuid:
+                resolved[key] = cached.mythic_file_uuid
+            continue
+
         if file_uuid:
             cached.mythic_file_uuid = file_uuid
             db.commit()
             resolved[key] = file_uuid
+
     return resolved
 
 
@@ -430,8 +460,20 @@ async def apply_graph_to_mythic(
     mythic_client = await _login_to_mythic(db=db)
 
     node_map = {node.id: node for node in payload.graph.nodes}
+
+    # If edges are missing (e.g. imported chain), rebuild from wrapped_payload/downloaded_payload references
+    edges = list(payload.graph.edges)
+    if not edges:
+        label_to_id = {node.data.label: node.id for node in payload.graph.nodes if node.data.label}
+        for node in payload.graph.nodes:
+            d = node.data
+            ref = getattr(d, 'wrapped_payload', None) or getattr(d, 'downloaded_payload', None)
+            if ref and ref in label_to_id:
+                from app.schemas.chain import GraphEdge
+                edges.append(GraphEdge(id=f'{label_to_id[ref]}->{node.id}', source=label_to_id[ref], target=node.id))
+
     incoming: dict[str, list[str]] = defaultdict(list)
-    for edge in payload.graph.edges:
+    for edge in edges:
         incoming[edge.target].append(edge.source)
 
     created_payloads: dict[str, dict[str, Any]] = {}
@@ -567,11 +609,19 @@ async def apply_graph_to_mythic(
                     suggestion='Set the Profile URL field in the downloader stage.',
                 )
             if not data.url_parameter:
-                raise MythicApplyStageError(
-                    f'Downloader stage {data.label} requires a url_parameter (build param name for the URL).',
-                    stage_label=data.label,
-                    suggestion='Set the URL Parameter field in the downloader stage.',
+                # Try to auto-detect from parameters: look for a key named 'downloader_url' (convention)
+                auto_url_param = next(
+                    (k for k in (data.parameters or {}) if k.lower() == 'downloader_url'),
+                    None
                 )
+                if auto_url_param:
+                    data = data.model_copy(update={'url_parameter': auto_url_param})
+                else:
+                    raise MythicApplyStageError(
+                        f'Downloader stage {data.label} requires a url_parameter (build param name for the URL).',
+                        stage_label=data.label,
+                        suggestion='Set the URL Parameter field in the downloader stage.',
+                    )
 
             # 1. Find the downloaded payload UUID and file UUID in Mythic
             downloaded_name = data.downloaded_payload

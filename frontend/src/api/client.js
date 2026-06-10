@@ -28,6 +28,7 @@ export const api = {
   updateSettings: (data) => request('PUT', '/settings', data),
   testConnection: (data) => request('POST', '/settings/test', data),
   testPayloadServer: (data) => request('POST', '/settings/test-payload-server', data),
+  resolveFileNames: (refs) => request('POST', '/files/names', { refs }),
 
   // Components / payload types
   getComponents: () => request('GET', '/components'),
@@ -54,8 +55,8 @@ export const api = {
       throw new Error(detail)
     }
     const data = await res.json()
-    // Return in the same shape as before but use filename as the identifier
-    return { file_id: data.filename, filename: data.filename, size: data.size }
+    // file_id is 'local:<sha256>' — stable identifier for export/deploy resolution
+    return { file_id: data.file_id, filename: data.filename, size: data.size }
   },
 
   // Deploy & live Mythic payloads

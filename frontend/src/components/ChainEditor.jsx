@@ -49,7 +49,7 @@ function CommandTag({ cmd, onRemove }) {
 
 // ── Typed Parameter Field ────────────────────────────────────────────────────
 
-function TypedParamField({ name, value, meta, onChange, onRemove }) {
+function TypedParamField({ name, value, meta, onChange, onRemove, displayName }) {
   const [uploading, setUploading] = useState(false)
   const [uploadError, setUploadError] = useState(null)
   const fileInputRef = useRef(null)
@@ -145,7 +145,7 @@ function TypedParamField({ name, value, meta, onChange, onRemove }) {
       setUploadError(null)
       try {
         const result = await api.uploadFileToMythic(file)
-        onChange(result.file_id)
+        onChange(result.file_id, result.filename)
       } catch (err) {
         setUploadError(err.message)
       } finally {
@@ -154,7 +154,9 @@ function TypedParamField({ name, value, meta, onChange, onRemove }) {
       }
     }
 
-    const isUuid = value && /^[0-9a-f-]{36}$/i.test(value)
+    // Determine what label to show: prefer displayName, never show raw local:/UUID
+    const isRef = value && (value.startsWith('local:') || /^[0-9a-f-]{36}$/i.test(value))
+    const shownName = displayName || (isRef ? null : value)
 
     control = (
       <div className="flex-1 space-y-1.5">
@@ -173,21 +175,16 @@ function TypedParamField({ name, value, meta, onChange, onRemove }) {
             onChange={handleFileUpload}
           />
           {value ? (
-            <span className={`font-mono text-xs truncate ${
-              isUuid ? 'text-yellow-500/70' : 'text-green-400'
-            }`} title={value}>
-              {isUuid ? `⚠️ UUID (legacy): ${value.slice(0, 8)}…` : `✓ ${value}`}
+            <span className={`text-xs truncate ${shownName ? 'text-green-400' : 'text-yellow-600 italic'}`} title={shownName || value}>
+              📄 {shownName || 'Resolving…'}
             </span>
           ) : (
             <span className="text-xs text-gray-600 italic">No file selected</span>
           )}
           {value && (
-            <button onClick={() => onChange('')} className="text-gray-600 hover:text-red-400 text-xs transition">✕</button>
+            <button onClick={() => onChange('', null)} className="text-gray-600 hover:text-red-400 text-xs transition">✕</button>
           )}
         </div>
-        {!isUuid && value && (
-          <div className="text-xs text-gray-600 italic">Will be uploaded to Mythic on deploy</div>
-        )}
         {uploadError && (
           <div className="text-xs text-red-400">✗ {uploadError}</div>
         )}
@@ -389,7 +386,7 @@ function CommandsSection({ commands, availableCommands, onChange }) {
 }
 
 
-function ParametersSection({ parameters, buildParamsMeta, onChange }) {
+function ParametersSection({ parameters, buildParamsMeta, onChange, fileNames, onFileChange }) {
   const [newKey, setNewKey] = useState('')
   const [newVal, setNewVal] = useState('')
 
@@ -411,7 +408,13 @@ function ParametersSection({ parameters, buildParamsMeta, onChange }) {
   // Known params not yet in parameters (available to add)
   const availableToAdd = (buildParamsMeta || []).filter(m => !(m.name in parameters))
 
-  const updateParam = (key, val) => onChange({ ...parameters, [key]: val })
+  const updateParam = (key, val, filename) => {
+    if (filename !== undefined && onFileChange) {
+      onFileChange({ ...parameters, [key]: val }, { key, filename })
+    } else {
+      onChange({ ...parameters, [key]: val })
+    }
+  }
   const removeParam = (key) => { const p = { ...parameters }; delete p[key]; onChange(p) }
 
   const addManual = () => {
@@ -442,8 +445,11 @@ function ParametersSection({ parameters, buildParamsMeta, onChange }) {
             name={meta.name}
             value={parameters[meta.name]}
             meta={meta}
-            onChange={val => updateParam(meta.name, val)}
+            onChange={(val, filename) => updateParam(meta.name, val, filename)}
             onRemove={!meta.required ? () => removeParam(meta.name) : null}
+            displayName={fileNames?.[meta.name]}
+            onFileChange={onFileChange}
+            paramKey={meta.name}
           />
         ))}
 
@@ -465,8 +471,11 @@ function ParametersSection({ parameters, buildParamsMeta, onChange }) {
                 name={key}
                 value={val}
                 meta={null}
-                onChange={v => updateParam(key, v)}
+                onChange={(v, filename) => updateParam(key, v, filename)}
                 onRemove={() => removeParam(key)}
+                displayName={fileNames?.[key]}
+                onFileChange={onFileChange}
+                paramKey={key}
               />
             </div>
           )
@@ -860,6 +869,19 @@ function StageCard({ node, index, total, components, c2Profiles, allNodes, onCha
           <ParametersSection
             parameters={filteredParams}
             buildParamsMeta={filteredMeta}
+            fileNames={d.file_names || {}}
+            onFileChange={(newParams, fileUpdate) => {
+              // Atomic update: parameters + file_names in one shot
+              const full = urlParamName
+                ? { ...newParams, [urlParamName]: d.parameters[urlParamName] ?? '' }
+                : newParams
+              const names = { ...(d.file_names || {}) }
+              if (fileUpdate) {
+                if (fileUpdate.filename) names[fileUpdate.key] = fileUpdate.filename
+                else delete names[fileUpdate.key]
+              }
+              update({ parameters: full, file_names: names })
+            }}
             onChange={params => {
               // Re-inject the url param with its current value when saving
               const full = urlParamName
@@ -907,6 +929,40 @@ export default function ChainEditor({ chain, onBack, onSaved }) {
     refreshComponents()
     api.getSettings().then(s => setPayloadServerUrl(s.payload_server_url || '')).catch(() => {})
   }, [])
+
+  // Resolve missing file_names for any file refs in parameters (run once on mount)
+  useEffect(() => {
+    const allRefs = new Set()
+    graph.nodes.forEach(node => {
+      const d = node.data || {}
+      const fileNames = d.file_names || {}
+      Object.entries(d.parameters || {}).forEach(([key, val]) => {
+        if (typeof val === 'string' && val &&
+            (val.startsWith('local:') || /^[0-9a-f-]{36}$/i.test(val)) &&
+            !fileNames[key]) {
+          allRefs.add(val)
+        }
+      })
+    })
+    if (allRefs.size === 0) return
+    api.resolveFileNames([...allRefs]).then(resolved => {
+      if (!resolved || Object.keys(resolved).length === 0) return
+      setGraph(prev => ({
+        ...prev,
+        nodes: prev.nodes.map(node => {
+          const d = node.data || {}
+          const updates = {}
+          Object.entries(d.parameters || {}).forEach(([key, val]) => {
+            if (typeof val === 'string' && resolved[val] && !(d.file_names || {})[key]) {
+              updates[key] = resolved[val]
+            }
+          })
+          if (Object.keys(updates).length === 0) return node
+          return { ...node, data: { ...d, file_names: { ...(d.file_names || {}), ...updates } } }
+        }),
+      }))
+    }).catch(() => {})
+  }, [])  // eslint-disable-line react-hooks/exhaustive-deps
 
   // Auto-validate graph on change
   const validateAndUpdate = useCallback((g) => {

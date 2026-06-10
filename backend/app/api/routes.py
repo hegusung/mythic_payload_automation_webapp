@@ -76,13 +76,14 @@ def get_settings(db: Session = Depends(get_db)):
 @router.put('/settings', response_model=SettingsRead)
 def update_settings(payload: SettingsWrite, db: Session = Depends(get_db)):
     current = settings_service.get_all(db)
-    update_data: dict[str, str | None] = {
-        'mythic_url':           payload.mythic_url,
-        'mythic_username':      payload.mythic_username,
-        'mythic_password':      payload.mythic_password      if payload.mythic_password      is not None else current.get('mythic_password'),
-        'payload_server_url':   payload.payload_server_url,
-        'payload_server_token': payload.payload_server_token if payload.payload_server_token is not None else current.get('payload_server_token'),
-    }
+    # Only overwrite a field if it was explicitly provided (not None)
+    # This allows each section (Mythic / Payload Server) to save independently
+    update_data: dict[str, str | None] = dict(current)  # start from current values
+    if payload.mythic_url           is not None: update_data['mythic_url']           = payload.mythic_url
+    if payload.mythic_username      is not None: update_data['mythic_username']      = payload.mythic_username
+    if payload.mythic_password      is not None: update_data['mythic_password']      = payload.mythic_password
+    if payload.payload_server_url   is not None: update_data['payload_server_url']   = payload.payload_server_url
+    if payload.payload_server_token is not None: update_data['payload_server_token'] = payload.payload_server_token
     settings_service.set_all(db, update_data)
     updated = _effective_settings(settings_service.get_all(db))
     return SettingsRead(
@@ -99,17 +100,15 @@ async def test_connection(payload: SettingsWrite, db: Session = Depends(get_db))
     from urllib.parse import urlparse
     from mythic import mythic as mythic_sdk
 
-    url = payload.mythic_url
-    username = payload.mythic_username
-    password = payload.mythic_password
-
-    # Fallback to stored creds if not provided
-    if not password:
-        stored = settings_service.get_all(db)
-        password = stored.get('mythic_password')
+    # Fallback to stored/env values for any field not provided
+    stored = settings_service.get_all(db)
+    effective = _effective_settings(stored)
+    url      = payload.mythic_url      or effective.get('mythic_url')
+    username = payload.mythic_username or effective.get('mythic_username')
+    password = payload.mythic_password or effective.get('mythic_password')
 
     if not url or not username or not password:
-        return ConnectionTestResult(ok=False, message='URL, username and password are required.')
+        return ConnectionTestResult(ok=False, message='URL, username and password are required. Save them first.')
 
     try:
         parsed = urlparse(url)
@@ -432,16 +431,17 @@ def _sha256(data: bytes) -> str:
 @router.post('/files/local')
 async def store_file_locally(file: UploadFile = File(...), db: Session = Depends(get_db)):
     """Store a file in the local cache only — does NOT upload to Mythic.
-    Returns {filename} which is used as the parameter value until deploy.
+    Returns {file_id: 'local:<sha256>', filename, size}.
+    The file_id is stored in the graph and resolved at export/deploy time.
     """
     from app.models.file_cache import FileCache
     contents = await file.read()
     fname = file.filename or 'unnamed'
     digest = _sha256(contents)
-    # Upsert by sha256 (same content → same entry, regardless of prior UUID)
+    local_id = f'local:{digest}'
+    # Upsert by sha256
     existing = db.query(FileCache).filter(FileCache.sha256 == digest).first()
     if existing:
-        # Update filename in case it changed, keep content and uuid
         existing.filename = fname
     else:
         db.add(FileCache(
@@ -452,7 +452,34 @@ async def store_file_locally(file: UploadFile = File(...), db: Session = Depends
             size=len(contents),
         ))
     db.commit()
-    return {'filename': fname, 'size': len(contents)}
+    return {'file_id': local_id, 'filename': fname, 'size': len(contents)}
+
+
+# ─── File name resolution ───────────────────────────────────────────────────
+
+from pydantic import BaseModel as _BaseModelFR
+class FileRefsIn(_BaseModelFR):
+    refs: list[str]
+
+@router.post('/files/names')
+def resolve_file_names(payload: FileRefsIn, db: Session = Depends(get_db)):
+    """Resolve a list of file refs (local:<sha256> or Mythic UUID) to {ref: filename} map."""
+    from app.models.file_cache import FileCache
+    result: dict[str, str] = {}
+    for ref in payload.refs:
+        if not ref:
+            continue
+        if ref.startswith('local:'):
+            sha = ref[len('local:'):]
+            cached = db.query(FileCache).filter(FileCache.sha256 == sha).first()
+            if cached:
+                result[ref] = cached.filename
+        else:
+            # Mythic UUID
+            cached = db.query(FileCache).filter(FileCache.mythic_file_uuid == ref).first()
+            if cached:
+                result[ref] = cached.filename
+    return result
 
 
 # ─── Export / Import ZIP ────────────────────────────────────────────────────
@@ -462,16 +489,22 @@ import re
 import zipfile
 
 _UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+_LOCAL_RE = re.compile(r'^local:[0-9a-f]{64}$')  # local:<sha256>
+
+
+def _is_file_ref(val: str) -> bool:
+    """Return True if val is a Mythic UUID or a local:<sha256> file reference."""
+    return bool(_UUID_RE.match(val) or _LOCAL_RE.match(val))
 
 
 def _find_file_uuids_in_graph(graph: dict) -> dict[str, str | None]:
-    """Walk a chain graph and return {uuid: None} for every File-param value."""
-    uuids: dict[str, str | None] = {}
+    """Walk a chain graph and return {ref: None} for every file-param value (UUID or local:sha256)."""
+    refs: dict[str, str | None] = {}
     for node in (graph.get('nodes') or []):
         for val in (node.get('data') or {}).get('parameters', {}).values():
-            if isinstance(val, str) and _UUID_RE.match(val):
-                uuids[val] = None
-    return uuids
+            if isinstance(val, str) and _is_file_ref(val):
+                refs[val] = None
+    return refs
 
 
 @router.get('/chains/{chain_id}/export')
@@ -502,6 +535,16 @@ async def export_chain_zip(chain_id: int, db: Session = Depends(get_db)):
         mythic_password = stored.get('mythic_password') or app_settings.mythic_password
 
         for uuid in file_uuids:
+            # Local file reference (local:<sha256>) — resolve from cache by sha256
+            if uuid.startswith('local:'):
+                sha = uuid[len('local:'):]
+                cached = db.query(FileCache).filter(FileCache.sha256 == sha).first()
+                if cached:
+                    file_contents[uuid] = cached.content
+                    uuid_to_name[uuid] = cached.filename
+                else:
+                    uuid_to_name[uuid] = f'{sha[:8]}.bin'
+                continue
             cached = db.query(FileCache).filter(FileCache.mythic_file_uuid == uuid).first()
             if cached:
                 file_contents[uuid] = cached.content
@@ -556,7 +599,7 @@ async def export_chain_zip(chain_id: int, db: Session = Depends(get_db)):
         # Replace file UUIDs with filenames
         params = {}
         for k, v in (d.get('parameters') or {}).items():
-            params[k] = uuid_to_name[v] if isinstance(v, str) and _UUID_RE.match(v) and v in uuid_to_name else v
+            params[k] = uuid_to_name[v] if isinstance(v, str) and _is_file_ref(v) and v in uuid_to_name else v
 
         stage: dict = {'label': d.get('label', ''), 'type': d.get('stage_type', 'base')}
         if d.get('payload'):         stage['payload'] = d['payload']
@@ -569,6 +612,7 @@ async def export_chain_zip(chain_id: int, db: Session = Depends(get_db)):
             stage['c2_profile'] = d['c2_profile']
         # Downloader-specific
         if d.get('stage_type') == 'downloader':
+            if d.get('base_url'):         stage['base_url'] = d['base_url']
             if d.get('profile_url'):      stage['profile_url'] = d['profile_url']
             if d.get('downloaded_payload'): stage['downloads'] = d['downloaded_payload']
         # Wrapper-specific
@@ -673,23 +717,39 @@ async def import_chain_zip(file: UploadFile = File(...), db: Session = Depends(g
     import time as _time
     if 'stages' in chain_data:
         nodes = []
+        # uuid_to_filename: reverse map for file_names reconstruction
+        uuid_to_filename = {v: k for k, v in filename_to_new_uuid.items()}
         for i, stage in enumerate(chain_data.get('stages') or []):
             params = {}
+            file_names: dict[str, str] = {}
             for k, v in (stage.get('parameters') or {}).items():
-                params[k] = filename_to_new_uuid[v] if isinstance(v, str) and v in filename_to_new_uuid else v
+                if isinstance(v, str) and v in filename_to_new_uuid:
+                    new_uuid = filename_to_new_uuid[v]
+                    params[k] = new_uuid
+                    file_names[k] = v  # original filename
+                else:
+                    params[k] = v
+                    # If value is a UUID already known, restore its filename
+                    if isinstance(v, str) and v in uuid_to_filename:
+                        file_names[k] = uuid_to_filename[v]
+            # Derive c2_profile string from c2_profiles array if not set
+            c2_profiles_list = stage.get('c2_profiles') or []
+            c2_profile_str = stage.get('c2_profile') or (c2_profiles_list[0].get('c2_profile') if c2_profiles_list else None)
             node_data = {
                 'label': stage.get('label', f'stage_{i+1}'),
                 'stage_type': stage.get('type', 'base'),
                 'payload': stage.get('payload'),
                 'os': stage.get('os', 'Windows'),
-                'c2_profile': stage.get('c2_profile'),
-                'c2_profiles': stage.get('c2_profiles', []),
+                'c2_profile': c2_profile_str,
+                'c2_profiles': c2_profiles_list,
                 'wrapped_payload': stage.get('wraps'),
                 'downloaded_payload': stage.get('downloads'),
+                'base_url': stage.get('base_url'),
                 'profile_url': stage.get('profile_url'),
                 'url_parameter': stage.get('url_parameter'),
                 'commands': stage.get('commands', []),
                 'parameters': params,
+                'file_names': file_names,
             }
             nodes.append({
                 'id': f'n{int(_time.time()*1000)+i}',
@@ -697,15 +757,31 @@ async def import_chain_zip(file: UploadFile = File(...), db: Session = Depends(g
                 'position': {'x': 340 + i * 320, 'y': 100},
                 'data': node_data,
             })
-        graph = {'nodes': nodes, 'edges': []}
+        # Rebuild edges from wrapped_payload/downloaded_payload references
+        label_to_id = {n['data']['label']: n['id'] for n in nodes if n.get('data', {}).get('label')}
+        edges = []
+        for n in nodes:
+            d = n.get('data', {})
+            ref = d.get('wrapped_payload') or d.get('downloaded_payload')
+            if ref and ref in label_to_id:
+                src = label_to_id[ref]
+                tgt = n['id']
+                edges.append({'id': f'{src}->{tgt}', 'source': src, 'target': tgt})
+        graph = {'nodes': nodes, 'edges': edges}
     else:
         # Legacy format with 'graph' key
         graph = chain_data.get('graph', {})
         for node in (graph.get('nodes') or []):
-            params = (node.get('data') or {}).get('parameters', {})
+            d = node.get('data') or {}
+            params = d.get('parameters', {})
             for key, val in params.items():
                 if isinstance(val, str) and val in filename_to_new_uuid:
                     params[key] = filename_to_new_uuid[val]
+            # Ensure c2_profile string is derived from c2_profiles array if absent
+            if not d.get('c2_profile'):
+                c2p = d.get('c2_profiles') or []
+                if c2p and c2p[0].get('c2_profile'):
+                    d['c2_profile'] = c2p[0]['c2_profile']
 
     # Deduplicate name
     base_name = chain_data.get('name', 'Imported chain')
