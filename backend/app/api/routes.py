@@ -498,12 +498,21 @@ def _is_file_ref(val: str) -> bool:
 
 
 def _find_file_uuids_in_graph(graph: dict) -> dict[str, str | None]:
-    """Walk a chain graph and return {ref: None} for every file-param value (UUID or local:sha256)."""
+    """Walk a chain graph and return {ref: None} for every file-param value (UUID or local:sha256).
+    Searches both build parameters and C2 profile parameters.
+    """
     refs: dict[str, str | None] = {}
     for node in (graph.get('nodes') or []):
-        for val in (node.get('data') or {}).get('parameters', {}).values():
+        d = node.get('data') or {}
+        # Build parameters
+        for val in d.get('parameters', {}).values():
             if isinstance(val, str) and _is_file_ref(val):
                 refs[val] = None
+        # C2 profile parameters
+        for prof in (d.get('c2_profiles') or []):
+            for val in (prof.get('c2_profile_parameters') or {}).values():
+                if isinstance(val, str) and _is_file_ref(val):
+                    refs[val] = None
     return refs
 
 
@@ -604,10 +613,17 @@ async def export_chain_zip(chain_id: int, db: Session = Depends(get_db)):
         stage: dict = {'label': d.get('label', ''), 'type': d.get('stage_type', 'base')}
         if d.get('payload'):         stage['payload'] = d['payload']
         if d.get('os'):              stage['os'] = d['os']
-        # C2 profiles
+        # C2 profiles — substitute file refs in c2_profile_parameters
         c2p = d.get('c2_profiles') or []
         if c2p:
-            stage['c2_profiles'] = c2p
+            resolved_c2p = []
+            for prof in c2p:
+                resolved_params = {
+                    k: (uuid_to_name[v] if isinstance(v, str) and _is_file_ref(v) and v in uuid_to_name else v)
+                    for k, v in (prof.get('c2_profile_parameters') or {}).items()
+                }
+                resolved_c2p.append({**prof, 'c2_profile_parameters': resolved_params})
+            stage['c2_profiles'] = resolved_c2p
         elif d.get('c2_profile'):
             stage['c2_profile'] = d['c2_profile']
         # Downloader-specific

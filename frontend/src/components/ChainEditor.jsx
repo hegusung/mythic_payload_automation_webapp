@@ -816,9 +816,16 @@ function StageCard({ node, index, total, components, c2Profiles, allNodes, onCha
         const currentC2 = d.c2_profiles?.[0] || {}
         const c2Params = currentC2.c2_profile_parameters || {}
 
-        const updateC2Param = (key, val) => {
+        const updateC2Param = (key, val, filename) => {
           const updated = { ...c2Params, [key]: val }
-          update({ c2_profiles: [{ c2_profile: d.c2_profile, c2_profile_parameters: updated }] })
+          const patch = { c2_profiles: [{ c2_profile: d.c2_profile, c2_profile_parameters: updated }] }
+          if (filename !== undefined) {
+            const names = { ...(d.file_names || {}) }
+            if (filename) names['c2:' + key] = filename
+            else delete names['c2:' + key]
+            patch.file_names = names
+          }
+          update(patch)
         }
 
         return (
@@ -835,8 +842,9 @@ function StageCard({ node, index, total, components, c2Profiles, allNodes, onCha
                     name={paramMeta.name}
                     value={c2Params[paramMeta.name] ?? paramMeta.default_value_decoded ?? paramMeta.default_value ?? ''}
                     meta={paramMeta}
-                    onChange={val => updateC2Param(paramMeta.name, val)}
+                    onChange={(val, filename) => updateC2Param(paramMeta.name, val, filename)}
                     onRemove={null}
+                    displayName={(d.file_names || {})['c2:' + paramMeta.name]}
                   />
                 ))}
               </div>
@@ -930,18 +938,22 @@ export default function ChainEditor({ chain, onBack, onSaved }) {
     api.getSettings().then(s => setPayloadServerUrl(s.payload_server_url || '')).catch(() => {})
   }, [])
 
-  // Resolve missing file_names for any file refs in parameters (run once on mount)
+  // Resolve missing file_names for any file refs in parameters + c2_profile_parameters
   useEffect(() => {
+    const isRef = v => typeof v === 'string' && v && (v.startsWith('local:') || /^[0-9a-f-]{36}$/i.test(v))
     const allRefs = new Set()
     graph.nodes.forEach(node => {
       const d = node.data || {}
       const fileNames = d.file_names || {}
+      // build params
       Object.entries(d.parameters || {}).forEach(([key, val]) => {
-        if (typeof val === 'string' && val &&
-            (val.startsWith('local:') || /^[0-9a-f-]{36}$/i.test(val)) &&
-            !fileNames[key]) {
-          allRefs.add(val)
-        }
+        if (isRef(val) && !fileNames[key]) allRefs.add(val)
+      })
+      // c2 params
+      ;(d.c2_profiles || []).forEach(prof => {
+        Object.entries(prof.c2_profile_parameters || {}).forEach(([key, val]) => {
+          if (isRef(val) && !fileNames['c2:' + key]) allRefs.add(val)
+        })
       })
     })
     if (allRefs.size === 0) return
@@ -952,10 +964,17 @@ export default function ChainEditor({ chain, onBack, onSaved }) {
         nodes: prev.nodes.map(node => {
           const d = node.data || {}
           const updates = {}
+          // build params
           Object.entries(d.parameters || {}).forEach(([key, val]) => {
-            if (typeof val === 'string' && resolved[val] && !(d.file_names || {})[key]) {
+            if (isRef(val) && resolved[val] && !(d.file_names || {})[key])
               updates[key] = resolved[val]
-            }
+          })
+          // c2 params (prefixed with 'c2:' to avoid collisions)
+          ;(d.c2_profiles || []).forEach(prof => {
+            Object.entries(prof.c2_profile_parameters || {}).forEach(([key, val]) => {
+              if (isRef(val) && resolved[val] && !(d.file_names || {})['c2:' + key])
+                updates['c2:' + key] = resolved[val]
+            })
           })
           if (Object.keys(updates).length === 0) return node
           return { ...node, data: { ...d, file_names: { ...(d.file_names || {}), ...updates } } }
