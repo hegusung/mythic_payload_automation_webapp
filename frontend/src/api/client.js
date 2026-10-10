@@ -28,6 +28,7 @@ export const api = {
   updateSettings: (data) => request('PUT', '/settings', data),
   testConnection: (data) => request('POST', '/settings/test', data),
   testPayloadServer: (data) => request('POST', '/settings/test-payload-server', data),
+  getPayloadServerTargets: () => request('GET', '/payload-server/targets'),
   resolveFileNames: (refs) => request('POST', '/files/names', { refs }),
 
   // Components / payload types

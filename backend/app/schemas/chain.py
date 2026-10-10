@@ -18,6 +18,10 @@ class GraphNodeData(BaseModel):
     profile_url: str | None = None
     base_url: str | None = None  # Base URL for downloader (e.g. https://{{DOMAIN1}})
     url_parameter: str | None = None
+    # payload-server delivery: None/absent → Mode 1 (payload-server hosts the file,
+    # download URL = base_url + profile_url). An int → Mode 2 (cloud deploy to that
+    # delivery target; download URL is the target's returned public_url).
+    payload_server_target_id: int | None = None
 
     @field_validator('label')
     @classmethod

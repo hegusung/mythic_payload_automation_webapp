@@ -353,10 +353,12 @@ async def _upload_to_payload_server(
     transform: str,
     xor_key: int,
     note: str,
-) -> None:
+) -> int | None:
     """
     Upload a payload binary to payload-server management API.
     Overwrites if same URI already exists.
+    Returns the payload-server file id (needed for Mode 2 cloud deploy), or None
+    if the response did not include one.
     """
     import aiohttp
     url = f'{server_url.rstrip("/")}/api/files'
@@ -376,6 +378,85 @@ async def _upload_to_payload_server(
             if resp.status not in (200, 201):
                 body = await resp.text()
                 raise ValueError(f'payload-server returned HTTP {resp.status}: {body}')
+            try:
+                info = await resp.json()
+            except Exception:
+                return None
+            return info.get('id') if isinstance(info, dict) else None
+
+
+async def _deploy_to_payload_server_target(
+    server_url: str,
+    server_token: str,
+    file_id: int,
+    target_id: int,
+    poll_timeout: float = 120.0,
+    poll_interval: float = 2.0,
+) -> str:
+    """
+    Mode 2 (cloud deploy): push an already-uploaded payload-server file to a
+    configured delivery target, then poll until the object is live and return
+    its public_url.
+
+    Raises ValueError on deploy/poll failure or timeout.
+    """
+    import asyncio
+    import aiohttp
+
+    base = server_url.rstrip('/')
+    headers = {'X-Token': server_token}
+    deploy_url = f'{base}/api/files/{file_id}/deploy'
+    deployments_url = f'{base}/api/deployments'
+
+    async with aiohttp.ClientSession() as session:
+        # Kick off the (asynchronous) deploy.
+        async with session.post(
+            deploy_url, json={'target_id': target_id}, headers=headers, ssl=False
+        ) as resp:
+            if resp.status not in (200, 201):
+                body = await resp.text()
+                raise ValueError(
+                    f'payload-server deploy returned HTTP {resp.status}: {body}'
+                )
+
+        # Poll /deployments until the matching (file, target) record is ready.
+        deadline = asyncio.get_event_loop().time() + poll_timeout
+        last_error = None
+        while asyncio.get_event_loop().time() < deadline:
+            async with session.get(
+                deployments_url, params={'file_id': str(file_id)}, headers=headers, ssl=False
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    raise ValueError(
+                        f'payload-server deployments query returned HTTP {resp.status}: {body}'
+                    )
+                rows = await resp.json()
+
+            match = next(
+                (d for d in (rows or []) if d.get('target_id') == target_id),
+                None,
+            )
+            if match:
+                status = match.get('status')
+                if status == 'deployed':
+                    public_url = match.get('public_url')
+                    if not public_url:
+                        raise ValueError(
+                            'payload-server reported status=deployed but no public_url'
+                        )
+                    return public_url
+                if status == 'error':
+                    raise ValueError(
+                        f'payload-server deploy failed: {match.get("error") or "unknown error"}'
+                    )
+                last_error = f'status={status}'
+            await asyncio.sleep(poll_interval)
+
+        raise ValueError(
+            f'payload-server deploy timed out after {poll_timeout:.0f}s'
+            + (f' (last {last_error})' if last_error else '')
+        )
 
 
 async def _wrap_filehost_envelope(
@@ -730,6 +811,10 @@ async def apply_graph_to_mythic(
             ps_url   = _ps_settings.get('payload_server_url')   or settings.payload_server_url   or None
             ps_token = _ps_settings.get('payload_server_token') or settings.payload_server_token or None
 
+            # Mode 2 (cloud deploy) sets this to the target's public_url; it then
+            # overrides the base_url + profile_url download URL built at step 4.
+            cloud_download_url = None
+
             if ps_url and ps_token:
                 # ── payload-server path ───────────────────────────────────────
                 await _emit({
@@ -762,7 +847,7 @@ async def apply_graph_to_mythic(
                         raw_bytes = await _resp.read()
 
                 try:
-                    await _upload_to_payload_server(
+                    ps_file_id = await _upload_to_payload_server(
                         server_url=ps_url,
                         server_token=ps_token,
                         payload_bytes=raw_bytes,
@@ -789,6 +874,40 @@ async def apply_graph_to_mythic(
                         f' (ct={dl_contenttype}, prepend={dl_prepend}B, append={dl_append}B{transform_info})'
                     ),
                 })
+
+                # ── Mode 2: cloud deploy to a delivery target ─────────────────
+                if data.payload_server_target_id is not None:
+                    if ps_file_id is None:
+                        raise MythicApplyStageError(
+                            f'Downloader stage {data.label}: payload-server did not return a'
+                            f' file id, cannot cloud-deploy (is payload-server up to date?).',
+                            stage_label=data.label,
+                        )
+                    await _emit({
+                        'type': 'log', 'level': 'info',
+                        'msg': (
+                            f'Downloader stage {data.label}: deploying to cloud target'
+                            f' #{data.payload_server_target_id}…'
+                        ),
+                    })
+                    try:
+                        cloud_download_url = await _deploy_to_payload_server_target(
+                            server_url=ps_url,
+                            server_token=ps_token,
+                            file_id=ps_file_id,
+                            target_id=data.payload_server_target_id,
+                        )
+                    except Exception as exc:
+                        raise MythicApplyStageError(
+                            f'Downloader stage {data.label}: cloud deploy failed: {exc}',
+                            stage_label=data.label,
+                        ) from exc
+                    await _emit({
+                        'type': 'log', 'level': 'success',
+                        'msg': (
+                            f'Downloader stage {data.label}: cloud-deployed → {cloud_download_url}'
+                        ),
+                    })
 
             else:
                 # ── Mythic c2HostFile path (legacy) ───────────────────────────
@@ -841,17 +960,21 @@ async def apply_graph_to_mythic(
                         stage_label=data.label,
                     )
 
-            # 4. Build the download URL: base_url (with vars resolved) + profile_url
-            base_url = _resolve_vars(data.base_url or '', variables).rstrip('/')
-            if not base_url:
-                raise MythicApplyStageError(
-                    f'Downloader stage {data.label}: Base URL is empty.'
-                    f' Set it in the stage (e.g. https://{{{{DOMAIN1}}}}).',
-                    stage_label=data.label,
-                    suggestion='Fill the Base URL field in the downloader stage.',
-                )
-
-            download_url = f'{base_url}{data.profile_url}'
+            # 4. Build the download URL.
+            #    Mode 2 (cloud deploy): use the target's public_url verbatim.
+            #    Mode 1 (payload-server / c2HostFile): base_url (vars resolved) + profile_url.
+            if cloud_download_url:
+                download_url = cloud_download_url
+            else:
+                base_url = _resolve_vars(data.base_url or '', variables).rstrip('/')
+                if not base_url:
+                    raise MythicApplyStageError(
+                        f'Downloader stage {data.label}: Base URL is empty.'
+                        f' Set it in the stage (e.g. https://{{{{DOMAIN1}}}}).',
+                        stage_label=data.label,
+                        suggestion='Fill the Base URL field in the downloader stage.',
+                    )
+                download_url = f'{base_url}{data.profile_url}'
 
             # 5. Add url_parameter to build params
             build_parameters.append({'name': data.url_parameter, 'value': download_url})

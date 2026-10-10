@@ -178,6 +178,52 @@ async def test_payload_server(payload: PayloadServerTestIn, db: Session = Depend
         return ConnectionTestResult(ok=False, message=f'Connection failed: {exc}')
 
 
+@router.get('/payload-server/targets')
+async def list_payload_server_targets(db: Session = Depends(get_db)):
+    """
+    Proxy payload-server's cloud delivery targets for the downloader-stage UI.
+    Returns {'configured': bool, 'targets': [...], 'error': str|None}. Degrades
+    gracefully (empty list) when payload-server is unset, unreachable, or too old
+    to expose /api/targets — the UI falls back to Mode 1 (host on payload-server).
+    """
+    import httpx
+    stored = _effective_settings(settings_service.get_all(db))
+    url = stored.get('payload_server_url')
+    token = stored.get('payload_server_token')
+
+    if not url or not token:
+        return {'configured': False, 'targets': [], 'error': None}
+
+    targets_url = url.rstrip('/') + '/api/targets'
+    try:
+        async with httpx.AsyncClient(timeout=5, verify=False) as client:
+            r = await client.get(targets_url, headers={'X-Token': token})
+    except Exception as exc:
+        return {'configured': True, 'targets': [], 'error': f'payload-server unreachable: {exc}'}
+
+    if r.status_code == 404:
+        return {
+            'configured': True, 'targets': [],
+            'error': 'payload-server does not expose /api/targets (update it for Mode 2 cloud deploy).',
+        }
+    if r.status_code == 401:
+        return {'configured': True, 'targets': [], 'error': 'payload-server token is invalid (401).'}
+    if not r.is_success:
+        return {'configured': True, 'targets': [], 'error': f'payload-server returned HTTP {r.status_code}.'}
+
+    try:
+        targets = r.json()
+    except Exception:
+        return {'configured': True, 'targets': [], 'error': 'payload-server returned a non-JSON target list.'}
+
+    # Expose only what the UI needs (id/name/provider_key) — never the secret config.
+    slim = [
+        {'id': t.get('id'), 'name': t.get('name'), 'provider_key': t.get('provider_key')}
+        for t in (targets or []) if isinstance(t, dict)
+    ]
+    return {'configured': True, 'targets': slim, 'error': None}
+
+
 # ─── Stats ────────────────────────────────────────────────────────────────────
 
 @router.get('/stats', response_model=StatsResponse)

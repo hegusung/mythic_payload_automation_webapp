@@ -526,7 +526,7 @@ function ParametersSection({ parameters, buildParamsMeta, onChange, fileNames, o
 
 // ── Stage Card ────────────────────────────────────────────────────────────────
 
-function StageCard({ node, index, total, components, c2Profiles, allNodes, onChange, onRemove, onMoveUp, onMoveDown, payloadServerUrl }) {
+function StageCard({ node, index, total, components, c2Profiles, allNodes, onChange, onRemove, onMoveUp, onMoveDown, payloadServerUrl, psTargets = [] }) {
   const [cmdInput, setCmdInput] = useState('')
   const [collapsed, setCollapsed] = useState(true)
 
@@ -610,7 +610,7 @@ function StageCard({ node, index, total, components, c2Profiles, allNodes, onCha
               <label className="block text-xs text-gray-500 mb-1">Type</label>
               <select
                 value={d.stage_type}
-                onChange={e => update({ stage_type: e.target.value, payload: null, wrapped_payload: null, downloaded_payload: null, c2_profile: null, c2_profiles: [], parameters: {}, commands: [] })}
+                onChange={e => update({ stage_type: e.target.value, payload: null, wrapped_payload: null, downloaded_payload: null, c2_profile: null, c2_profiles: [], parameters: {}, commands: [], payload_server_target_id: null })}
                 className="w-full bg-gray-900/60 border border-gray-600/30 rounded px-2.5 py-1.5 text-sm text-gray-100 focus:outline-none focus:border-blue-500/60"
               >
                 <option value="base">Base</option>
@@ -774,7 +774,11 @@ function StageCard({ node, index, total, components, c2Profiles, allNodes, onCha
               </label>
               <select
                 value={d.c2_profile || ''}
-                onChange={e => update({ c2_profile: e.target.value || null })}
+                onChange={e => {
+                  const v = e.target.value || null
+                  // Leaving payload-server drops the Mode 2 cloud target.
+                  update(v === 'payload-server' ? { c2_profile: v } : { c2_profile: v, payload_server_target_id: null })
+                }}
                 className="w-full bg-gray-900/60 border border-gray-600/30 rounded px-2.5 py-1.5 text-sm text-gray-100 focus:outline-none focus:border-orange-500/60"
               >
                 <option value="">— Select C2 —</option>
@@ -788,6 +792,32 @@ function StageCard({ node, index, total, components, c2Profiles, allNodes, onCha
                 <p className="text-xs text-yellow-500/80 mt-1">⚠️ payload-server URL not configured in Settings</p>
               )}
             </div>
+            {d.c2_profile === 'payload-server' && (
+              <div>
+                <label className="block text-xs text-gray-500 mb-1">
+                  Delivery <span className="text-orange-400">(payload-server)</span>
+                </label>
+                <select
+                  value={d.payload_server_target_id ?? ''}
+                  onChange={e => update({ payload_server_target_id: e.target.value === '' ? null : Number(e.target.value) })}
+                  className="w-full bg-gray-900/60 border border-gray-600/30 rounded px-2.5 py-1.5 text-sm text-gray-100 focus:outline-none focus:border-orange-500/60"
+                >
+                  <option value="">🖥 Host on payload-server (Mode 1)</option>
+                  {psTargets.length > 0 && <option disabled>──── cloud targets ────</option>}
+                  {psTargets.map(t => (
+                    <option key={t.id} value={t.id}>☁ {t.name}{t.provider_key ? ` (${t.provider_key})` : ''}</option>
+                  ))}
+                </select>
+                {d.payload_server_target_id != null && (
+                  <p className="text-xs text-orange-300/70 mt-1">
+                    Cloud deploy: the injected URL is the target's <span className="font-mono">public_url</span> — Base URL is ignored.
+                  </p>
+                )}
+                {psTargets.length === 0 && (
+                  <p className="text-xs text-gray-500 mt-1">No cloud targets configured in payload-server — add one in its 🚀 Targets tab for Mode 2.</p>
+                )}
+              </div>
+            )}
             <div>
               <label className="block text-xs text-gray-500 mb-1">Base URL</label>
               <input
@@ -922,6 +952,8 @@ export default function ChainEditor({ chain, onBack, onSaved }) {
 
   const [syncingMythic, setSyncingMythic] = useState(false)
   const [payloadServerUrl, setPayloadServerUrl] = useState('')
+  // payload-server cloud delivery targets (Mode 2); empty list → Mode 1 only
+  const [psTargets, setPsTargets] = useState([])
 
   // Load components + C2 profiles
   const refreshComponents = () => {
@@ -936,6 +968,7 @@ export default function ChainEditor({ chain, onBack, onSaved }) {
   useEffect(() => {
     refreshComponents()
     api.getSettings().then(s => setPayloadServerUrl(s.payload_server_url || '')).catch(() => {})
+    api.getPayloadServerTargets().then(r => setPsTargets(r.targets || [])).catch(() => {})
   }, [])
 
   // Resolve missing file_names for any file refs in parameters + c2_profile_parameters
@@ -1242,6 +1275,7 @@ export default function ChainEditor({ chain, onBack, onSaved }) {
                     onMoveUp={() => moveUp(i)}
                     onMoveDown={() => moveDown(i)}
                     payloadServerUrl={payloadServerUrl}
+                    psTargets={psTargets}
                   />
                 ))
               )}
