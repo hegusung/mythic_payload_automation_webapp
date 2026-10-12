@@ -612,13 +612,8 @@ async def apply_graph_to_mythic(
         stage_description = f'{tag_prefix}{base_description}'.strip()
 
         if data.stage_type == 'base':
-            if not data.c2_profiles:
-                raise MythicApplyStageError(
-                    f'Payload stage {data.label} must include at least one C2 profile for live Mythic apply.',
-                    stage_label=data.label,
-                    suggestion='Add a C2 profile in the inspector or export YAML instead of running live apply.',
-                )
-
+            # No C2 profile is allowed — Mythic can build a base payload with no
+            # egress C2 (e.g. P2P / linked agents). Pass through whatever is set.
             c2_profiles_normalized = _normalize_c2_profiles(data.c2_profiles or [])
 
             async def operation():
